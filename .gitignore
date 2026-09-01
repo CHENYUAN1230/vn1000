@@ -1,0 +1,23 @@
+# Kernel module build artifacts (kbuild out-of-tree build)
+*.o
+*.o.cmd
+*.ko
+*.ko.cmd
+*.mod
+*.mod.c
+*.mod.o
+*.mod.cmd
+*.symvers
+*.order
+*.a
+*.s
+.*.cmd
+.tmp_versions/
+.cache.mk
+Module.symvers
+modules.order
+.depend
+
+# Editor / OS cruft
+*~
+.DS_Store
