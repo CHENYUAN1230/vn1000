@@ -1,60 +1,65 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef VNIC_L2_H
 #define VNIC_L2_H
 #include "vnic_regs.h"
+#include "vnic-hal.h"
 
-#undef PDEBUG             /* undef it, just in case */
+#undef PDEBUG			/* undef it, just in case */
 #ifdef VNIC_DEBUG
 #  ifdef __KERNEL__
-     /* This one if debugging is on, and kernel space */
-#    define PDEBUG(fmt, args...) printk( KERN_DEBUG "vnic: " fmt, ## args)
+	/* debugging on, kernel space */
+#    define PDEBUG(fmt, args...) printk(KERN_DEBUG "vnic: " fmt, ## args)
 #  else
-     /* This one for user space */
+	/* debugging on, user space */
 #    define PDEBUG(fmt, args...) fprintf(stderr, fmt, ## args)
 #  endif
 #else
-#  define PDEBUG(fmt, args...) /* not debugging: nothing */
+#  define PDEBUG(fmt, args...)	/* not debugging: nothing */
 #endif
 
-/* custom ring size */
 #define VNIC_TX_RING_SIZE 256
 #define VNIC_RX_RING_SIZE 256
-extern struct net_device *netdev; // single device
 
+extern struct net_device *netdev;	/* the single device */
+
+/**
+ * struct vnic_ring - one TX or RX descriptor ring
+ * @desc: array of @count descriptors (the device reads/writes these)
+ * @count: number of descriptors
+ * @next_to_use: TX: value to write into TDT; RX: value to write into RDT
+ * @next_to_clean: TX: reclaimed by vnic_tx_poll(), trails TDH;
+ *                 RX: delivered by vnic_rx_poll(), trails RDH
+ * @lock: serialises the driver's producer/consumer against each other and
+ *        against vnic_{tx,rx}_drain()
+ * @bufs: array of @count skb pointers, parallel to @desc
+ */
 struct vnic_ring {
-	struct vn_desc *desc; // array of descriptors; each element is a real struct vn_desc value
+	struct vn_desc *desc;
 	u32 count;
-	u32 next_to_use; // tx: value to write into TDT. rx: value to write into RDT
-	u32 next_to_clean; // tx: reclaimed by vnic_tx_poll(), trails TDH. rx: delivered by vnic_rx_poll(), trails RDH
+	u32 next_to_use;
+	u32 next_to_clean;
 	spinlock_t lock;
-	struct sk_buff **bufs; // array of skb pointers; each element is a struct sk_buff *
+	struct sk_buff **bufs;
 };
 
-
-/*
- * This structure is private to each device. It is used to pass
- * packets in and out, so there is place for a packet
+/**
+ * struct vnic_priv - per-device private state (netdev_priv area)
+ * @hal: backend handle; the only way the core reaches "the device"
+ * @tx_ring: transmit descriptor ring
+ * @rx_ring: receive descriptor ring
+ * @dev: back-pointer to the owning net_device
+ * @napi: NAPI context for the poll loop
+ * @rx_buf_size: RX skb size, tracks the MTU
+ * @intr_tasklet: bottom half for the simulated interrupt
  */
-
 struct vnic_priv {
-	/*
-	 * a pointer here would need an extra kzalloc:
-	 * struct vnic_ring *tx_ring;
-	 * struct vnic_ring *rx_ring;
-	 */
-
-	/* vn_desc define in "vnic_regs.h", List of incoming packets */
-	struct vnic_ring tx_ring; 
-	struct vnic_ring rx_ring;  
-	spinlock_t lock;
+	struct vnic_hal *hal;
+	struct vnic_ring tx_ring;
+	struct vnic_ring rx_ring;
 	struct net_device *dev;
 	struct napi_struct napi;
-	u32 regs[VN_BAR0_SIZE/4];
-	bool doorbell;
-	wait_queue_head_t wq;
-	struct task_struct *engine; // kthread
 	u32 rx_buf_size;
 	struct tasklet_struct intr_tasklet;
-	struct mutex run_lock; // serializes an engine run vs vnic_release()'s quiesce
 };
 
-#endif
+#endif /* VNIC_L2_H */
