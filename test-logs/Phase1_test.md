@@ -3,13 +3,13 @@
 ## Background
 
 Phase 1 goal: introduce the **HAL seam** without touching the datapath. The baseline
-(`4e20b5c`) is `vnic-l1`'s Phase 7 driver copied verbatim as a single `vnic-l2.c`. Phase 1
+(`4e20b5c`) is `vnic-l1`'s Phase 7 driver copied verbatim as a single file. Phase 1
 splits it into:
 
 | file | role |
 |---|---|
 | `include/vnic-hal.h` | the interface: `vnic_hal_rd32/wr32`, `vnic_hal_wr32_raw`, `vnic_hal_ring_alloc/free`, `vnic_hal_map/unmap/mapping_error`, `vnic_hal_quiesce`, `vnic_hal_create/stop/destroy` |
-| `driver/vnic-hal-engine.c` | L1 backend — owns `struct vnic_hal` (regs[], engine kthread, `ICR/ICS/IMS/IMC` semantics, loopback); opaque to core |
+| `driver/vnic-hal-engine.c` | in-kernel engine backend — owns `struct vnic_hal` (regs[], engine kthread, `ICR/ICS/IMS/IMC` semantics, loopback); opaque to core |
 | `driver/vnic-core.c` | the netdev driver — reaches the "device" only through `vnic-hal.h` |
 
 Everything that is *packet flow* — `vnic_tx`, `vnic_poll`, `vnic_tx_poll`, `vnic_rx_poll`,
@@ -43,9 +43,9 @@ the same basis `vnic-l1`'s Phase 1 / Phase 7 logs used.
 Per-`insmod` setup (loopback target MAC for the engine's IP-swap):
 
 ```bash
-sudo ip link set vnicl2_loop0 up
-sudo ip addr add 10.1.0.1/24 dev vnicl2_loop0
-sudo ip neigh replace 10.1.0.2 lladdr 02:00:00:00:00:02 dev vnicl2_loop0 nud permanent
+sudo ip link set vnic0 up
+sudo ip addr add 10.1.0.1/24 dev vnic0
+sudo ip neigh replace 10.1.0.2 lladdr 02:00:00:00:00:02 dev vnic0 nud permanent
 ```
 
 ## Test Steps
@@ -55,31 +55,31 @@ sudo ip neigh replace 10.1.0.2 lladdr 02:00:00:00:00:02 dev vnicl2_loop0 nud per
 `driver/Makefile` now builds one module from two objects:
 
 ```make
-obj-m     := vnic-l2.o
-vnic-l2-y := vnic-core.o vnic-hal-engine.o
+obj-m	:= vnic.o
+vnic-y	:= vnic-core.o vnic-hal-engine.o
 ```
 
 ```bash
-cd ~/vnic-l2/driver
+cd driver
 make clean && make DEBUG=y
 ```
 
-Expected: `vnic-l2.ko` produced, zero warnings, MODPOST resolves every `vnic_hal_*` symbol
+Expected: `vnic.ko` produced, zero warnings, MODPOST resolves every `vnic_hal_*` symbol
 (proves core↔backend link across the seam).
 
 Result:
 
 ```
-  CC [M]  /home/dev/vnic-l2/driver/vnic-core.o
-  CC [M]  /home/dev/vnic-l2/driver/vnic-hal-engine.o
-  LD [M]  /home/dev/vnic-l2/driver/vnic-l2.o
-  MODPOST /home/dev/vnic-l2/driver/Module.symvers
-  CC [M]  /home/dev/vnic-l2/driver/vnic-l2.mod.o
-  LD [M]  /home/dev/vnic-l2/driver/vnic-l2.ko
+  CC [M]  driver/vnic-core.o
+  CC [M]  driver/vnic-hal-engine.o
+  LD [M]  driver/vnic.o
+  MODPOST driver/Module.symvers
+  CC [M]  driver/vnic.mod.o
+  LD [M]  driver/vnic.ko
 ```
 
 Zero warnings (plain `make` without `DEBUG=y` also builds clean). `modinfo`: single module
-`vnic-l2.ko`, `vermagic 6.8.0-139-generic`. `nm vnic-l2.o` shows all ten `vnic_hal_*`
+`vnic.ko`, `vermagic 6.8.0-139-generic`. `nm vnic.o` shows all twelve `vnic_hal_*`
 entry points as `T` (defined) — the backend provides the whole interface.
 
 PASSED.
@@ -88,7 +88,7 @@ PASSED.
 
 ```bash
 sudo dmesg -C
-sudo insmod vnic-l2.ko
+sudo insmod vnic.ko
 ```
 
 Expected: `insmod` exit 0; `netdev_info` line prints the ID **read back via
@@ -100,19 +100,19 @@ Result:
 ```
 insmod exit=0
 
-[ 6325.704703] vnic_l2: loading out-of-tree module taints kernel.
-[ 6325.704721] vnic_l2: module verification failed: signature and/or required key missing - tainting kernel
-[ 6325.708157] vnicl2_loop0: VN1000 Level 2 (baseline: in-kernel engine) loaded (ID=0x564e3130)
+[ 6325.704703] vnic: loading out-of-tree module taints kernel.
+[ 6325.704721] vnic: module verification failed: signature and/or required key missing - tainting kernel
+[ 6325.708157] vnic0: VN1000 loaded, in-kernel engine backend (ID=0x564e3130)
 
 $ lsmod | grep vnic
-vnic_l2                20480  0
+vnic                20480  0
 
-$ ip -br link show vnicl2_loop0
-vnicl2_loop0     DOWN           02:ab:c6:50:d9:0f <BROADCAST,MULTICAST>
+$ ip -br link show vnic0
+vnic0     DOWN           02:ab:c6:50:d9:0f <BROADCAST,MULTICAST>
 
-$ cat /sys/class/net/vnicl2_loop0/address   ->  02:ab:c6:50:d9:0f
-$ cat /sys/class/net/vnicl2_loop0/mtu       ->  1500
-$ ps -eo pid,comm | grep vnic               ->  5331 vnic-l2-engine
+$ cat /sys/class/net/vnic0/address   ->  02:ab:c6:50:d9:0f
+$ cat /sys/class/net/vnic0/mtu       ->  1500
+$ ps -eo pid,comm | grep vnic               ->  5331 vnic-engine
 ```
 
 PASSED.
@@ -120,11 +120,11 @@ PASSED.
 ### 3. Loopback ping + counter parity
 
 ```bash
-sudo ip link set vnicl2_loop0 up
-sudo ip addr add 10.1.0.1/24 dev vnicl2_loop0
-sudo ip neigh replace 10.1.0.2 lladdr 02:00:00:00:00:02 dev vnicl2_loop0 nud permanent
+sudo ip link set vnic0 up
+sudo ip addr add 10.1.0.1/24 dev vnic0
+sudo ip neigh replace 10.1.0.2 lladdr 02:00:00:00:00:02 dev vnic0 nud permanent
 ping -c 5 -i 0.3 -W 1 10.1.0.2
-ip -s link show vnicl2_loop0
+ip -s link show vnic0
 ```
 
 Expected: 5/5. `ip -s link` RX == TX (bytes and packets) — these come from
@@ -148,7 +148,7 @@ backend:
 
 ```
 vnic: vnic_tx: queued idx=15 len=90
-vnic: vnic_engine_run: processed th 15->16, txp=16 rxp=16 rxdrop=0
+vnic: engine_run: processed th 15->16, txp=16 rxp=16 rxdrop=0
 vnic: vnic_intr_tasklet: masked TX/RX/RXEMPTY, mask now=0x8
 vnic: vnic_rx_poll: delivered 1/64 (budget), next_to_clean=16, next_to_use=15
 vnic: vnic_poll: budget=64 work_done=1
@@ -197,8 +197,8 @@ PASSED.
 ### 6. Raw-socket flood — datapath keeps up, counter parity at scale
 
 ```bash
-sudo python3 raw_flood_l2.py 20000     # then 200000
-ip -s link show vnicl2_loop0
+sudo python3 raw_flood.py 20000     # then 200000
+ip -s link show vnic0
 ```
 
 Expected: every frame transmitted is looped back and delivered; RX == TX; `dropped=0`.
@@ -220,9 +220,9 @@ PASSED.
 ### 7. E3 (adapted) — MTU range rejection
 
 ```bash
-sudo ip link set vnicl2_loop0 mtu 67     # < VN_MTU_MIN (68)
-sudo ip link set vnicl2_loop0 mtu 9001   # > VN_MTU_MAX (9000)
-sudo ip link set vnicl2_loop0 mtu 9000   # in range, but interface UP
+sudo ip link set vnic0 mtu 67     # < VN_MTU_MIN (68)
+sudo ip link set vnic0 mtu 9001   # > VN_MTU_MAX (9000)
+sudo ip link set vnic0 mtu 9000   # in range, but interface UP
 ```
 
 Result:
@@ -243,8 +243,8 @@ PASSED.
 ### 8. down / up cycle — drain & re-post through the seam
 
 ```bash
-sudo ip link set vnicl2_loop0 down
-sudo ip link set vnicl2_loop0 up
+sudo ip link set vnic0 down
+sudo ip link set vnic0 up
 ping -c 3 10.1.0.2
 ```
 
@@ -270,8 +270,8 @@ Phase 3) behaves exactly like the baseline's direct `priv->regs[x/4] = val` poke
 ### 9. H1 — `rmmod` while the interface is UP (no `down` first)
 
 ```bash
-ip -br link show vnicl2_loop0     # confirm UP,LOWER_UP
-sudo rmmod vnic_l2
+ip -br link show vnic0     # confirm UP,LOWER_UP
+sudo rmmod vnic
 ```
 
 Expected: `unregister_netdev()` invokes `vnic_release()` internally, *then* `vnic_cleanup()`
@@ -288,7 +288,7 @@ vnic: vnic_release: closing, draining rx ring
 vnic: vnic_tx_drain: freed 0 tx buffers
 vnic: vnic_rx_drain: freed 255 rx buffers
 
-$ ip link show vnicl2_loop0   ->  Device "vnicl2_loop0" does not exist.
+$ ip link show vnic0   ->  Device "vnic0" does not exist.
 $ ps -eo comm | grep vnic     ->  (no vnic kthread)
 $ lsmod | grep vnic           ->  (not loaded)
 ```
@@ -298,15 +298,15 @@ PASSED — engine kthread gone, no leftover state, `dmesg` clean.
 ### 10. H2 — double `insmod` rejected
 
 ```bash
-sudo insmod vnic-l2.ko   # 1st
-sudo insmod vnic-l2.ko   # 2nd
+sudo insmod vnic.ko   # 1st
+sudo insmod vnic.ko   # 2nd
 ```
 
 Result:
 
 ```
 1st insmod exit=0
-insmod: ERROR: could not insert module vnic-l2.ko: File exists   (exit 1)
+insmod: ERROR: could not insert module vnic.ko: File exists   (exit 1)
 ```
 
 PASSED — standard module mechanism, no driver-specific handling.
@@ -315,13 +315,13 @@ PASSED — standard module mechanism, no driver-specific handling.
 
 ```bash
 for i in 1 2 3 4 5; do
-  sudo insmod vnic-l2.ko
-  sudo ip link set vnicl2_loop0 up
-  sudo ip addr add 10.1.0.1/24 dev vnicl2_loop0
-  sudo ip neigh replace 10.1.0.2 lladdr 02:00:00:00:00:02 dev vnicl2_loop0 nud permanent
+  sudo insmod vnic.ko
+  sudo ip link set vnic0 up
+  sudo ip addr add 10.1.0.1/24 dev vnic0
+  sudo ip neigh replace 10.1.0.2 lladdr 02:00:00:00:00:02 dev vnic0 nud permanent
   ping -c 3 10.1.0.2
-  sudo ip link set vnicl2_loop0 down
-  sudo rmmod vnic_l2
+  sudo ip link set vnic0 down
+  sudo rmmod vnic
 done
 ```
 
@@ -363,10 +363,10 @@ Phase 1 passed. The HAL split is behavior-preserving:
 
 Design notes carried by this phase (see `vnic-hal.h` comments):
 
-- **Ring-base registers (TDBAL/TDBAH/TDLEN, RX ditto) are not programmed by core.** The L1
-  engine reaches the rings through `hal->priv`; TDH/TDT/RDH/RDT start at 0 from the kzalloc'd
-  `hal->regs`. When the L2 backend lands, `vnic_hal_ring_alloc()` itself will write the
-  `dma_alloc_coherent()` address into those registers — core never sees a DMA address.
+- **Ring-base registers (TDBAL/TDBAH/TDLEN, RX ditto) are not programmed by core.** The
+  in-kernel engine reaches the rings through `hal->priv`; TDH/TDT/RDH/RDT start at 0 from the
+  kzalloc'd `hal->regs`. When the PCI backend lands, `vnic_hal_ring_alloc()` itself will write
+  the `dma_alloc_coherent()` address into those registers — core never sees a DMA address.
 - **`vnic_hal_wr32_raw()`** (plain `regs[off/4] = val`, no doorbell) is Phase 1's chosen way
   for the drain paths to resync TDH/TDT/RDH/RDT; the CTRL.TXEN/RXEN gate is deferred to Phase 3.
 

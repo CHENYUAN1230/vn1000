@@ -103,7 +103,8 @@ typedef uint8_t  u8;
 
 /**
  * struct vn_desc - VN1000 TX/RX descriptor (datasheet section 5)
- * @addr:   buffer address - DMA address (Level 2) or kernel token (Level 1)
+ * @addr:   buffer address - a DMA address, or a kernel pointer for the
+ *          in-kernel engine backend
  * @len:    TX: packet length; RX (on completion): bytes received
  * @flags:  TX: command bits (%VN_TXF_EOP, %VN_TXF_RS); RX: result (%VN_RXF_*)
  * @status: DD ownership bit (%VN_DESC_DD); driver clears -> 0, device sets -> 1

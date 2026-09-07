@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
-/* vnic-hal-engine.c - Level 1 HAL backend
+/* vnic-hal-engine.c - in-kernel engine HAL backend
  *
- * A kthread plays the role of the NIC. The core driver reaches it only through
- * the vnic-hal.h interface; struct vnic_hal is defined here and is opaque to
- * the core.
+ * The baseline backend: a kthread plays the role of the NIC. The core driver
+ * reaches it only through the vnic-hal.h interface; struct vnic_hal is defined
+ * here and is opaque to the core. The PCI/DMA/MSI backend replaces this file
+ * from Phase 2 on.
  */
 
 #include <linux/kernel.h>
@@ -21,11 +22,11 @@
 #include <linux/ip.h>            /* struct iphdr */
 #include <linux/skbuff.h>
 
-#include "vnic-l2.h"
+#include "vnic.h"
 #include "vnic-hal.h"
 
 /**
- * struct vnic_hal - private state of the L1 backend
+ * struct vnic_hal - private state of the in-kernel engine backend
  * @priv: back-pointer to the core; engine_run() needs its rings and tasklet
  * @regs: fake BAR0 register file
  * @reg_lock: guards the read-modify-write on ICR / IMS
@@ -59,8 +60,8 @@ static void vnic_tx_flip_addr(struct sk_buff *skb);
  * @hal: backend handle
  * @off: register byte offset (VN_REG_*)
  *
- * The core's only path to a register read. L1 backs registers with a plain
- * array; ICR is read-to-clear, emulated here under @hal->reg_lock.
+ * The core's only path to a register read. This backend backs registers with a
+ * plain array; ICR is read-to-clear, emulated here under @hal->reg_lock.
  *
  * Return: the register value.
  */
@@ -136,12 +137,12 @@ void vnic_hal_wr32_raw(struct vnic_hal *hal, u32 off, u32 val)
 
 /**
  * vnic_hal_ring_alloc() - allocate one TX or RX descriptor ring
- * @hal: backend handle (unused by L1; L2 needs it to program the ring base)
+ * @hal: backend handle (unused by this backend; kept for the PCI backend)
  * @ring: ring to populate (->desc, ->bufs, ->count, ->lock)
  * @count: number of descriptors
  *
- * How the ring memory is obtained is the backend's business - L1 uses kcalloc,
- * L2 will use dma_alloc_coherent().
+ * How the ring memory is obtained is the backend's business - this backend uses
+ * kcalloc, the PCI backend will use dma_alloc_coherent().
  *
  * Return: 0 on success, -ENOMEM on failure (the ring is left freed).
  */
@@ -191,9 +192,9 @@ void vnic_hal_ring_free(struct vnic_hal *hal, struct vnic_ring *ring)
 
 /* per-packet DMA mapping
  *
- * L1 has no bus and no IOMMU, so these are trivial - but the signatures match
- * what L2 needs (a direction, a failure path) so Phase 3 can swap only the
- * backend.
+ * This backend has no bus and no IOMMU, so these are trivial - but the
+ * signatures match what the PCI backend needs (a direction, a failure path) so
+ * Phase 3 can swap only the backend.
  */
 
 /**
@@ -203,7 +204,8 @@ void vnic_hal_ring_free(struct vnic_hal *hal, struct vnic_ring *ring)
  * @len: buffer length
  * @dir: DMA direction
  *
- * L1 returns the pointer as an identity address; L2 is dma_map_single().
+ * This backend returns the pointer as an identity address; the PCI backend
+ * uses dma_map_single().
  *
  * Return: the address the device should use; test it with
  * vnic_hal_mapping_error().
@@ -221,7 +223,7 @@ dma_addr_t vnic_hal_map(struct vnic_hal *hal, void *va, size_t len,
  * @len: length passed to vnic_hal_map()
  * @dir: direction passed to vnic_hal_map()
  *
- * No-op on L1; dma_unmap_single() on L2.
+ * No-op in this backend; dma_unmap_single() in the PCI backend.
  */
 void vnic_hal_unmap(struct vnic_hal *hal, dma_addr_t dma, size_t len,
 		    enum dma_data_direction dir)
@@ -233,7 +235,7 @@ void vnic_hal_unmap(struct vnic_hal *hal, dma_addr_t dma, size_t len,
  * @hal: backend handle
  * @dma: address returned by vnic_hal_map()
  *
- * Return: non-zero if the mapping failed; always 0 on L1.
+ * Return: non-zero if the mapping failed; always 0 in this backend.
  */
 int vnic_hal_mapping_error(struct vnic_hal *hal, dma_addr_t dma)
 {
@@ -259,7 +261,7 @@ void vnic_hal_quiesce(struct vnic_hal *hal)
 }
 
 /**
- * vnic_hal_create() - allocate and start the L1 backend
+ * vnic_hal_create() - allocate and start the in-kernel engine backend
  * @priv: owning core device, stored as a back-pointer
  *
  * The one place the core names a concrete backend. Fills the RO identity
@@ -293,7 +295,7 @@ struct vnic_hal *vnic_hal_create(struct vnic_priv *priv)
 	/* start the engine last: it parks on the doorbell wq until the first
 	 * TDT / RDT write, so nothing above can race it
 	 */
-	hal->engine = kthread_run(engine_thread, hal, "vnic-l2-engine");
+	hal->engine = kthread_run(engine_thread, hal, "vnic-engine");
 	if (IS_ERR(hal->engine)) {
 		ret = PTR_ERR(hal->engine);
 		goto err_free_hal;
@@ -370,7 +372,7 @@ static void engine_run(struct vnic_hal *hal)
 
 	while (th != tt && rh != rt) { /* one slot reserved for full vs. empty */
 		if (READ_ONCE(rx_ring->desc[rh].status) & VN_DESC_DD) {
-			PDEBUG("vnic_engine_run: rx ring full at rh=%u, stalling th=%u\n", rh, th);
+			PDEBUG("engine_run: rx ring full at rh=%u, stalling th=%u\n", rh, th);
 			vnic_hal_wr32(hal, VN_REG_ICS, VN_INT_RXEMPTY);
 			break;
 		}
@@ -380,10 +382,10 @@ static void engine_run(struct vnic_hal *hal)
 		 * back; skip th without touching rh
 		 */
 		if (tx_ring->bufs[th]->len < sizeof(struct ethhdr)) {
-			PDEBUG("vnic_engine_run: loopback dropped frame at th=%u (len=%u too short)\n", th, tx_ring->bufs[th]->len);
+			PDEBUG("engine_run: loopback dropped frame at th=%u (len=%u too short)\n", th, tx_ring->bufs[th]->len);
 			rxdrop++;
 		} else {
-			/* L1-ism: real hardware DMAs from desc->addr; Phase 3 replaces this */
+			/* real hardware DMAs from desc->addr; the PCI backend replaces this memcpy */
 			memcpy(rx_ring->bufs[rh]->data, tx_ring->bufs[th]->data, tx_ring->bufs[th]->len);
 			skb_put(rx_ring->bufs[rh], tx_ring->bufs[th]->len);
 			vnic_tx_flip_addr(rx_ring->bufs[rh]);
@@ -409,7 +411,7 @@ static void engine_run(struct vnic_hal *hal)
 	spin_unlock_bh(&rx_ring->lock);
 
 	if (th != th_start) {
-		PDEBUG("vnic_engine_run: processed th %u->%u, txp=%u rxp=%u rxdrop=%u\n", th_start, th, txp, rxp, rxdrop);
+		PDEBUG("engine_run: processed th %u->%u, txp=%u rxp=%u rxdrop=%u\n", th_start, th, txp, rxp, rxdrop);
 		vnic_hal_wr32(hal, VN_REG_ICS, VN_INT_TXDONE);
 	}
 	if (rh != rh_start)

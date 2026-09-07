@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef VNIC_L2_H
-#define VNIC_L2_H
+#ifndef VNIC_H
+#define VNIC_H
 #include "vnic_regs.h"
 #include "vnic-hal.h"
 
@@ -62,4 +62,4 @@ struct vnic_priv {
 	struct tasklet_struct intr_tasklet;
 };
 
-#endif /* VNIC_L2_H */
+#endif /* VNIC_H */

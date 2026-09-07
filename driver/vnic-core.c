@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-/* vnic-core.c - VN1000 Level 2 netdev core
+/* vnic-core.c - VN1000 netdev core
  *
- * The datapath (rings, NAPI, ownership handshakes) copied from vnic-l1. It
- * reaches "the device" only through the vnic-hal.h interface; the backend
- * (vnic-hal-engine.c for the baseline) implements it.
+ * The datapath (rings, NAPI, ownership handshakes). It reaches "the device"
+ * only through the vnic-hal.h interface; the backend (vnic-hal-engine.c for
+ * the baseline) implements it.
  *
  * TODO: batch refill - accumulate N completions before refilling the rx ring;
  * ring the TX doorbell only every N packets.
@@ -29,7 +29,7 @@
 #include <linux/skbuff.h>
 #include <linux/version.h>	/* LINUX_VERSION_CODE */
 
-#include "vnic-l2.h"
+#include "vnic.h"
 
 #include <linux/in6.h>
 #include <asm/checksum.h>
@@ -443,7 +443,7 @@ static int vnic_init_module(void)
 	if (!netdev)
 		return -ENOMEM;
 
-	strscpy(netdev->name, "vnicl2_loop%d", sizeof(netdev->name));
+	strscpy(netdev->name, "vnic%d", sizeof(netdev->name));
 	netdev->netdev_ops = &vnic_netdev_ops;
 	eth_hw_addr_random(netdev);	/* let the kernel assign a random MAC */
 	netdev->min_mtu = VN_MTU_MIN;
@@ -456,7 +456,7 @@ static int vnic_init_module(void)
 	tasklet_setup(&priv->intr_tasklet, vnic_intr_tasklet);	/* setup already enables the tasklet */
 	tasklet_disable(&priv->intr_tasklet);			/* disable first, enabled in open() */
 
-	/* Bring up the L1 backend ("the device"): vnic_hal_create() allocates
+	/* Bring up the backend ("the device"): vnic_hal_create() allocates
 	 * struct vnic_hal, fills the RO identity registers (ID/VERSION/CAP) and
 	 * the initial IMS mask, and starts the engine kthread. The kthread parks
 	 * on the doorbell wait queue until vnic_open() first writes TDT/RDT, so
@@ -478,11 +478,11 @@ static int vnic_init_module(void)
 	if (ret)
 		goto free_tx_ring;
 
-	/* No ring-base registers to program here. The L1 engine reaches the
-	 * rings directly through hal->priv, so it never reads TDBAL/TDBAH/TDLEN;
-	 * TDH/TDT/RDH/RDT all start at 0 (hal->regs is kzalloc'd). When the L2
-	 * backend lands, vnic_hal_ring_alloc() itself writes the DMA address it
-	 * got from dma_alloc_coherent() into those registers.
+	/* No ring-base registers to program here. The in-kernel engine reaches
+	 * the rings directly through hal->priv, so it never reads
+	 * TDBAL/TDBAH/TDLEN; TDH/TDT/RDH/RDT all start at 0 (hal->regs is
+	 * kzalloc'd). When the PCI backend lands, vnic_hal_ring_alloc() itself
+	 * writes the dma_alloc_coherent() address into those registers.
 	 */
 
 	ret = register_netdev(netdev); /* should be the last step */
@@ -490,7 +490,7 @@ static int vnic_init_module(void)
 		netdev_err(netdev, "failed to register netdev: %d\n", ret);
 		goto free_rx_ring; /* not registered yet - skip unregister_netdev() */
 	}
-	netdev_info(netdev, "VN1000 Level 2 (baseline: in-kernel engine) loaded (ID=0x%08x)\n",
+	netdev_info(netdev, "VN1000 loaded, in-kernel engine backend (ID=0x%08x)\n",
 		    vnic_hal_rd32(priv->hal, VN_REG_ID));
 	return 0;
 

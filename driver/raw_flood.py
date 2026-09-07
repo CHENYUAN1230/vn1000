@@ -1,6 +1,6 @@
 import socket, struct, sys
 
-iface = "vnic_loop0"
+iface = "vnic0"
 count = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
 
 s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
