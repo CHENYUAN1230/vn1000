@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
-/* vnic-hal-engine.c - in-kernel engine HAL backend
+/* vnic-engine.c - the in-kernel engine build of the VN1000 driver
  *
- * The baseline backend: a kthread plays the role of the NIC. The core driver
- * reaches it only through the vnic-hal.h interface; struct vnic_hal is defined
- * here and is opaque to the core. The PCI/DMA/MSI backend replaces this file
- * from Phase 2 on.
+ * The build-specific half for VNIC_BACKEND=engine: a kthread plays the role of
+ * the NIC. Contains struct vnic_hal (opaque to vnic-core.c), the vnic-hal.h
+ * implementation, and this build's module entry point. The PCI build uses
+ * vnic-pci.c instead.
  */
 
+#include <linux/module.h>
+#include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>          /* kzalloc, kcalloc, kfree */
 #include <linux/errno.h>
@@ -16,9 +18,10 @@
 #include <linux/wait.h>
 #include <linux/sched.h>
 #include <linux/kthread.h>
-#include <linux/interrupt.h>     /* tasklet_schedule */
+#include <linux/interrupt.h>     /* tasklet */
+#include <linux/string.h>        /* strscpy */
 #include <linux/netdevice.h>
-#include <linux/etherdevice.h>   /* eth_type_trans, ETH_ALEN */
+#include <linux/etherdevice.h>   /* alloc_etherdev, eth_hw_addr_random, ETH_ALEN */
 #include <linux/ip.h>            /* struct iphdr */
 #include <linux/skbuff.h>
 
@@ -27,31 +30,38 @@
 
 /**
  * struct vnic_hal - private state of the in-kernel engine backend
- * @priv: back-pointer to the core; engine_run() needs its rings and tasklet
+ * @priv: back-pointer to the core; engine_run() needs its rings
  * @regs: fake BAR0 register file
  * @reg_lock: guards the read-modify-write on ICR / IMS
  * @wq: the engine kthread waits here for the doorbell
  * @engine: the kthread that plays "the device"
  * @run_lock: serialises one engine run against vnic_hal_quiesce()
  * @doorbell: set when TDT / RDT is written
+ * @intr_tasklet: the fake ISR bottom half; engine_run() schedules it, it
+ *                schedules NAPI. The PCI backend has a real hardirq ISR instead.
  *
- * The core only passes this pointer around, never looks inside, so every field
+ * Opaque to vnic-core.c: it only ever holds a struct vnic_hal *, so every field
  * that is really "the hardware" lives here rather than in struct vnic_priv.
  */
 struct vnic_hal {
-	struct vnic_priv   *priv;
-	u32                 regs[VN_BAR0_SIZE / 4];
-	spinlock_t          reg_lock;
-	wait_queue_head_t   wq;
-	struct task_struct *engine;
-	struct mutex        run_lock;
-	bool                doorbell;
+	struct vnic_priv     *priv;
+	u32                   regs[VN_BAR0_SIZE / 4];
+	spinlock_t            reg_lock;
+	wait_queue_head_t     wq;
+	struct task_struct   *engine;
+	struct mutex          run_lock;
+	bool                  doorbell;
+	struct tasklet_struct intr_tasklet;
 };
 
-/* internal: kthread body + loopback header rewrite */
+/* internal: kthread body, tasklet, loopback rewrite, lifecycle helpers */
 static void engine_run(struct vnic_hal *hal);
 static int  engine_thread(void *data);
-static void vnic_tx_flip_addr(struct sk_buff *skb);
+static void engine_intr_tasklet(struct tasklet_struct *t);
+static void engine_flip_addr(struct sk_buff *skb);
+static struct vnic_hal *engine_create(struct vnic_priv *priv);
+static void engine_stop(struct vnic_hal *hal);
+static void engine_destroy(struct vnic_hal *hal);
 
 /* register access */
 
@@ -261,17 +271,41 @@ void vnic_hal_quiesce(struct vnic_hal *hal)
 }
 
 /**
- * vnic_hal_create() - allocate and start the in-kernel engine backend
- * @priv: owning core device, stored as a back-pointer
+ * vnic_hal_irq_request() - arm the completion interrupt (ndo_open)
+ * @hal: backend handle
  *
- * The one place the core names a concrete backend. Fills the RO identity
- * registers and the initial interrupt mask, then starts the engine kthread,
- * which parks on the doorbell until the interface is brought up.
+ * Sets up the tasklet that engine_run() schedules as the fake ISR bottom half.
+ * The PCI backend does request_irq() here instead.
  *
- * Context: process context, may sleep.
- * Return: the backend handle, or an ERR_PTR() on failure.
+ * Return: 0 (this backend cannot fail).
  */
-struct vnic_hal *vnic_hal_create(struct vnic_priv *priv)
+int vnic_hal_irq_request(struct vnic_hal *hal)
+{
+	tasklet_setup(&hal->intr_tasklet, engine_intr_tasklet);
+	return 0;
+}
+
+/**
+ * vnic_hal_irq_free() - disarm the completion interrupt (ndo_stop)
+ * @hal: backend handle
+ *
+ * tasklet_kill() flushes a bottom half already scheduled. Called after
+ * vnic_hal_quiesce() so engine_run() will not reschedule it.
+ */
+void vnic_hal_irq_free(struct vnic_hal *hal)
+{
+	tasklet_kill(&hal->intr_tasklet);
+}
+
+/* engine_create - allocate the backend, seed the RO registers, start the kthread
+ *
+ * Called from this file's module_init. Fills ID/VERSION/CAP + the initial IMS
+ * mask, then starts the engine kthread, which parks on the doorbell until the
+ * interface is brought up.
+ *
+ * Return: the handle, or an ERR_PTR() on failure. Context: may sleep.
+ */
+static struct vnic_hal *engine_create(struct vnic_priv *priv)
 {
 	int ret;
 	struct vnic_hal *hal;
@@ -308,33 +342,50 @@ err_free_hal:
 	return ERR_PTR(ret);
 }
 
-/**
- * vnic_hal_stop() - stop the engine without freeing the handle
- * @hal: backend handle
+/* engine_stop - kthread_stop the engine; the handle stays valid
  *
- * Teardown order is stop -> vnic_hal_ring_free() -> vnic_hal_destroy(): the
- * engine must be off the rings before their memory goes away, and @hal must
- * stay valid for the ring_free calls.
+ * Teardown order is engine_stop -> vnic_hal_ring_free() -> engine_destroy():
+ * the engine must be off the rings before their memory goes away.
  */
-void vnic_hal_stop(struct vnic_hal *hal)
+static void engine_stop(struct vnic_hal *hal)
 {
 	if (hal->engine)
 		kthread_stop(hal->engine);
 }
 
-/**
- * vnic_hal_destroy() - free the backend handle
- * @hal: backend handle
- *
- * Final teardown step; call only after vnic_hal_stop() and any
- * vnic_hal_ring_free().
- */
-void vnic_hal_destroy(struct vnic_hal *hal)
+/* engine_destroy - free the handle. Last teardown step. */
+static void engine_destroy(struct vnic_hal *hal)
 {
 	kfree(hal);
 }
 
 /* internal: the fake device */
+
+/* engine_intr_tasklet - the fake ISR bottom half
+ *
+ * engine_run() schedules this after a pass. It reads the interrupt cause,
+ * checks it against the mask, and (if a TX/RX-relevant cause is set and
+ * unmasked) closes those mask bits and schedules NAPI. ERR alone does not wake
+ * NAPI: an OOM is not something a poll can fix.
+ */
+static void engine_intr_tasklet(struct tasklet_struct *t)
+{
+	struct vnic_hal *hal = from_tasklet(hal, t, intr_tasklet);
+	struct vnic_priv *priv = hal->priv;
+	u32 cause = vnic_hal_rd32(hal, VN_REG_ICR);
+	u32 mask = vnic_hal_rd32(hal, VN_REG_IMS);
+
+	if (cause & mask & ~VN_INT_ERR) {
+		if (napi_schedule_prep(&priv->napi)) {
+			vnic_hal_wr32(hal, VN_REG_IMC,
+				      VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY);
+			PDEBUG("engine_intr_tasklet: masked TX/RX/RXEMPTY, mask now=0x%x\n",
+			       vnic_hal_rd32(hal, VN_REG_IMS));
+			__napi_schedule(&priv->napi);
+		}
+		PDEBUG("engine_intr_tasklet: cause=0x%x, mask=0x%x\n", cause, mask);
+	}
+}
 
 /* engine_run - loop [TDH, TDT) TX frames back into the RX ring
  *
@@ -388,7 +439,7 @@ static void engine_run(struct vnic_hal *hal)
 			/* real hardware DMAs from desc->addr; the PCI backend replaces this memcpy */
 			memcpy(rx_ring->bufs[rh]->data, tx_ring->bufs[th]->data, tx_ring->bufs[th]->len);
 			skb_put(rx_ring->bufs[rh], tx_ring->bufs[th]->len);
-			vnic_tx_flip_addr(rx_ring->bufs[rh]);
+			engine_flip_addr(rx_ring->bufs[rh]);
 			rx_ring->desc[rh].len = tx_ring->desc[th].len;
 			rxp++;
 			rxb += rx_ring->desc[rh].len;
@@ -421,7 +472,7 @@ static void engine_run(struct vnic_hal *hal)
 	vnic_hal_wr32(hal, VN_REG_TDH, th);
 	vnic_hal_wr32(hal, VN_REG_STAT_TXPKTS, txp);
 	vnic_hal_wr32(hal, VN_REG_STAT_TXBYTES, txb);
-	tasklet_schedule(&priv->intr_tasklet);
+	tasklet_schedule(&hal->intr_tasklet);
 }
 
 /* engine_thread - kthread main loop: wait for the doorbell, run one pass,
@@ -444,11 +495,11 @@ static int engine_thread(void *data)
 	return 0;
 }
 
-/* vnic_tx_flip_addr - loopback header rewrite: swap Ethernet src / dst (so
+/* engine_flip_addr - loopback header rewrite: swap Ethernet src / dst (so
  * eth_type_trans() sees PACKET_HOST) and, for IPv4, swap the addresses and
  * rebuild the header checksum. Non-IPv4 (ARP, IPv6 ND) gets only the MAC swap.
  */
-static void vnic_tx_flip_addr(struct sk_buff *skb)
+static void engine_flip_addr(struct sk_buff *skb)
 {
 	struct ethhdr *eth = (struct ethhdr *)skb->data;
 	u8 eth_tmp[ETH_ALEN];
@@ -468,3 +519,94 @@ static void vnic_tx_flip_addr(struct sk_buff *skb)
 		iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
 	}
 }
+
+/* ======================================================================
+ * module entry: build the vnic0 netdev on the in-kernel engine backend
+ * ==================================================================== */
+
+/* Non-NULL iff a registered vnic0 exists (set only after init fully succeeds). */
+static struct net_device *vnic_netdev;
+
+/*
+ * __init / __exit: section markers. __init code lands in .init.text, which the
+ * kernel frees once the module has finished loading (the init function runs
+ * once). __exit code lands in .exit.text, kept for rmmod but dropped entirely
+ * if the kernel is built without module-unload support. module_init() pairs
+ * with an __init function, module_exit() with __exit.
+ */
+static int __init vnic_engine_init(void)
+{
+	struct net_device *netdev;
+	struct vnic_priv *priv;
+	int ret;
+
+	netdev = alloc_etherdev(sizeof(struct vnic_priv));
+	if (!netdev)
+		return -ENOMEM;
+
+	strscpy(netdev->name, "vnic%d", sizeof(netdev->name));
+	netdev->netdev_ops = &vnic_netdev_ops;
+	eth_hw_addr_random(netdev);
+	netdev->min_mtu = VN_MTU_MIN;
+	netdev->max_mtu = VN_MTU_MAX;
+
+	priv = netdev_priv(netdev);
+	priv->dev = netdev;
+	netif_napi_add(netdev, &priv->napi, vnic_poll);
+
+	priv->hal = engine_create(priv);
+	if (IS_ERR(priv->hal)) {
+		ret = PTR_ERR(priv->hal);
+		goto err_free_netdev;
+	}
+
+	ret = vnic_hal_ring_alloc(priv->hal, &priv->tx_ring, VNIC_TX_RING_SIZE);
+	if (ret)
+		goto err_destroy_hal;
+
+	ret = vnic_hal_ring_alloc(priv->hal, &priv->rx_ring, VNIC_RX_RING_SIZE);
+	if (ret)
+		goto err_free_tx_ring;
+
+	ret = register_netdev(netdev);
+	if (ret) {
+		netdev_err(netdev, "failed to register netdev: %d\n", ret);
+		goto err_free_rx_ring;
+	}
+
+	vnic_netdev = netdev;
+	netdev_info(netdev, "VN1000 loaded, in-kernel engine backend (ID=0x%08x)\n",
+		    vnic_hal_rd32(priv->hal, VN_REG_ID));
+	return 0;
+
+err_free_rx_ring:
+	vnic_hal_ring_free(priv->hal, &priv->rx_ring);
+err_free_tx_ring:
+	vnic_hal_ring_free(priv->hal, &priv->tx_ring);
+err_destroy_hal:
+	engine_stop(priv->hal);
+	engine_destroy(priv->hal);
+err_free_netdev:
+	free_netdev(netdev);		/* also calls netif_napi_del() */
+	return ret;
+}
+
+/* Only reached if vnic_engine_init() returned 0, so vnic_netdev is non-NULL. */
+static void __exit vnic_engine_exit(void)
+{
+	struct vnic_priv *priv = netdev_priv(vnic_netdev);
+
+	unregister_netdev(vnic_netdev);
+	engine_stop(priv->hal);
+	vnic_hal_ring_free(priv->hal, &priv->rx_ring);
+	vnic_hal_ring_free(priv->hal, &priv->tx_ring);
+	engine_destroy(priv->hal);
+	free_netdev(vnic_netdev);
+}
+
+module_init(vnic_engine_init);
+module_exit(vnic_engine_exit);
+
+MODULE_AUTHOR("Yu An Chen");
+MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("VN1000 virtual NIC, in-kernel engine backend");

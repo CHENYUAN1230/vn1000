@@ -14,8 +14,13 @@ ccflags-y += $(DEBFLAGS)
 ifneq ($(KERNELRELEASE),)
 # call from kernel build system
 ccflags-y += -I$(src)/../include
+
+# Build-specific half: VNIC_BACKEND=engine (in-kernel kthread, default) or =pci
+# (real PCI/MMIO/DMA/MSI). vnic-core.o is shared; the linker resolves the
+# vnic_hal_* calls against whichever half is linked in.
+VNIC_BACKEND ?= engine
 obj-m	:= vnic.o
-vnic-y	:= vnic-core.o vnic-hal-engine.o
+vnic-y	:= vnic-core.o vnic-$(VNIC_BACKEND).o
 
 else
 
