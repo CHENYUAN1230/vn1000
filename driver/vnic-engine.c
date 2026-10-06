@@ -58,7 +58,7 @@ struct vnic_hal {
 static void engine_run(struct vnic_hal *hal);
 static int  engine_thread(void *data);
 static void engine_intr_tasklet(struct tasklet_struct *t);
-static void engine_flip_addr(struct sk_buff *skb);
+static void engine_flip_addr(struct sk_buff *skb, u32 len);
 static struct vnic_hal *engine_create(struct vnic_priv *priv);
 static void engine_stop(struct vnic_hal *hal);
 static void engine_destroy(struct vnic_hal *hal);
@@ -99,9 +99,9 @@ u32 vnic_hal_rd32(struct vnic_hal *hal, u32 off)
  * @val: value to write
  *
  * The core's only path to a register write, emulating what real hardware does
- * on the bus write: ICS ORs into ICR; IMS / IMC set / clear the interrupt mask;
- * TDT / RDT ring the doorbell and wake the engine; anything else is a plain
- * store.
+ * on the bus write: ICS ORs into ICR; IMS / IMC set / clear the interrupt
+ * mask; CTRL.RST zeroes TDH/RDH and self-clears; TDT / RDT ring the doorbell
+ * and wake the engine; anything else is a plain store.
  */
 void vnic_hal_wr32(struct vnic_hal *hal, u32 off, u32 val)
 {
@@ -119,6 +119,15 @@ void vnic_hal_wr32(struct vnic_hal *hal, u32 off, u32 val)
 		spin_lock_irqsave(&hal->reg_lock, flags);
 		hal->regs[VN_REG_IMS / 4] &= ~val;
 		spin_unlock_irqrestore(&hal->reg_lock, flags);
+	} else if (off == VN_REG_CTRL) {
+		spin_lock_irqsave(&hal->reg_lock, flags);
+		if (val & VN_CTRL_RST) {
+			hal->regs[VN_REG_TDH / 4] = 0;
+			hal->regs[VN_REG_RDH / 4] = 0;
+			val &= ~VN_CTRL_RST;        /* self-clearing */
+		}
+		hal->regs[VN_REG_CTRL / 4] = val;
+		spin_unlock_irqrestore(&hal->reg_lock, flags);
 	} else {
 		hal->regs[off / 4] = val;
 		if (off == VN_REG_TDT || off == VN_REG_RDT) {
@@ -126,21 +135,6 @@ void vnic_hal_wr32(struct vnic_hal *hal, u32 off, u32 val)
 			wake_up_interruptible(&hal->wq);
 		}
 	}
-}
-
-/**
- * vnic_hal_wr32_raw() - write a register with no side effects
- * @hal: backend handle
- * @off: register byte offset (VN_REG_*)
- * @val: value to write
- *
- * Used by the drain paths to reset TDH / TDT / RDH / RDT without ringing the
- * TDT / RDT doorbell. Phase 1 approach; a CTRL.TXEN / RXEN gate is deferred to
- * Phase 3.
- */
-void vnic_hal_wr32_raw(struct vnic_hal *hal, u32 off, u32 val)
-{
-	hal->regs[off / 4] = val;
 }
 
 /* descriptor ring memory */
@@ -297,11 +291,14 @@ void vnic_hal_irq_free(struct vnic_hal *hal)
 	tasklet_kill(&hal->intr_tasklet);
 }
 
-/* engine_create - allocate the backend, seed the RO registers, start the kthread
+/* engine_create - allocate the backend, seed the RO registers, allocate the
+ * rings, start the kthread
  *
- * Called from this file's module_init. Fills ID/VERSION/CAP + the initial IMS
- * mask, then starts the engine kthread, which parks on the doorbell until the
- * interface is brought up.
+ * Called from this file's module_init, once netdev/priv already exist. Fills
+ * ID/VERSION/CAP + the initial IMS mask, allocates the TX/RX rings, then
+ * starts the engine kthread last: it parks on the doorbell wq until the first
+ * TDT / RDT write, so nothing above it can race it, and if kthread_run()
+ * fails there is nothing left running that needs to be torn back down.
  *
  * Return: the handle, or an ERR_PTR() on failure. Context: may sleep.
  */
@@ -326,17 +323,26 @@ static struct vnic_hal *engine_create(struct vnic_priv *priv)
 	vnic_hal_wr32(hal, VN_REG_IMS,
 		      VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
 
-	/* start the engine last: it parks on the doorbell wq until the first
-	 * TDT / RDT write, so nothing above can race it
-	 */
+	ret = vnic_hal_ring_alloc(hal, &priv->tx_ring, VNIC_TX_RING_SIZE);
+	if (ret)
+		goto err_free_hal;
+
+	ret = vnic_hal_ring_alloc(hal, &priv->rx_ring, VNIC_RX_RING_SIZE);
+	if (ret)
+		goto err_free_tx_ring;
+
 	hal->engine = kthread_run(engine_thread, hal, "vnic-engine");
 	if (IS_ERR(hal->engine)) {
 		ret = PTR_ERR(hal->engine);
-		goto err_free_hal;
+		goto err_free_rx_ring;
 	}
 
 	return hal;
 
+err_free_rx_ring:
+	vnic_hal_ring_free(hal, &priv->rx_ring);
+err_free_tx_ring:
+	vnic_hal_ring_free(hal, &priv->tx_ring);
 err_free_hal:
 	kfree(hal);
 	return ERR_PTR(ret);
@@ -344,8 +350,8 @@ err_free_hal:
 
 /* engine_stop - kthread_stop the engine; the handle stays valid
  *
- * Teardown order is engine_stop -> vnic_hal_ring_free() -> engine_destroy():
- * the engine must be off the rings before their memory goes away.
+ * Teardown order is engine_stop() -> engine_destroy(): the engine must be off
+ * the rings before engine_destroy() frees their memory.
  */
 static void engine_stop(struct vnic_hal *hal)
 {
@@ -353,15 +359,24 @@ static void engine_stop(struct vnic_hal *hal)
 		kthread_stop(hal->engine);
 }
 
-/* engine_destroy - free the handle. Last teardown step. */
+/* engine_destroy - free the rings and the handle. Last teardown step.
+ *
+ * Only ever called on a fully-built hal (past engine_create()'s own internal
+ * ladder), so both rings are always present here.
+ */
 static void engine_destroy(struct vnic_hal *hal)
 {
+	vnic_hal_ring_free(hal, &hal->priv->rx_ring);
+	vnic_hal_ring_free(hal, &hal->priv->tx_ring);
 	kfree(hal);
 }
 
 /* internal: the fake device */
 
-/* engine_intr_tasklet - the fake ISR bottom half
+/**
+ * engine_intr_tasklet() - the fake ISR bottom half
+ * @t: the tasklet embedded in struct vnic_hal as @intr_tasklet;
+ *     from_tasklet() recovers the containing struct vnic_hal *
  *
  * engine_run() schedules this after a pass. It reads the interrupt cause,
  * checks it against the mask, and (if a TX/RX-relevant cause is set and
@@ -396,20 +411,31 @@ static void engine_intr_tasklet(struct tasklet_struct *t)
  */
 static void engine_run(struct vnic_hal *hal)
 {
-	struct vnic_priv *priv = hal->priv;
-	struct vnic_ring *tx_ring = &priv->tx_ring;
-	u32 th = vnic_hal_rd32(hal, VN_REG_TDH);
-	u32 tt = vnic_hal_rd32(hal, VN_REG_TDT);
-	u32 txp = vnic_hal_rd32(hal, VN_REG_STAT_TXPKTS);
-	u32 txb = vnic_hal_rd32(hal, VN_REG_STAT_TXBYTES);
+	u32 ctrl = vnic_hal_rd32(hal, VN_REG_CTRL);
+	if ((ctrl & (VN_CTRL_TXEN | VN_CTRL_RXEN)) != (VN_CTRL_TXEN | VN_CTRL_RXEN))
+		return;
 
-	struct vnic_ring *rx_ring = &priv->rx_ring;
-	u32 rh, rt;
-	u32 rxp = vnic_hal_rd32(hal, VN_REG_STAT_RXPKTS);
-	u32 rxb = vnic_hal_rd32(hal, VN_REG_STAT_RXBYTES);
-	u32 rxdrop = vnic_hal_rd32(hal, VN_REG_STAT_RXDROP);
-	u32 th_start = th;
-	u32 rh_start;
+	struct vnic_priv *priv;
+	struct vnic_ring *tx_ring;
+	struct vnic_ring *rx_ring;
+	u32 th, tt, txp, txb;
+	u32 rh, rt, rxp, rxb;
+	u32 rxdrop;
+	u32 th_start, rh_start;
+
+	priv = hal->priv;
+
+	tx_ring = &priv->tx_ring;
+	th = vnic_hal_rd32(hal, VN_REG_TDH);
+	tt = vnic_hal_rd32(hal, VN_REG_TDT);
+	txp = vnic_hal_rd32(hal, VN_REG_STAT_TXPKTS);
+	txb = vnic_hal_rd32(hal, VN_REG_STAT_TXBYTES);
+
+	rx_ring = &priv->rx_ring;
+	rxp = vnic_hal_rd32(hal, VN_REG_STAT_RXPKTS);
+	rxb = vnic_hal_rd32(hal, VN_REG_STAT_RXBYTES);
+	rxdrop = vnic_hal_rd32(hal, VN_REG_STAT_RXDROP);
+	th_start = th;
 
 	/* No tx_ring->lock here: that lock only serialises vnic_tx() against
 	 * vnic_tx_poll(), not the engine, which is excluded from tx_ring only by
@@ -438,8 +464,7 @@ static void engine_run(struct vnic_hal *hal)
 		} else {
 			/* real hardware DMAs from desc->addr; the PCI backend replaces this memcpy */
 			memcpy(rx_ring->bufs[rh]->data, tx_ring->bufs[th]->data, tx_ring->bufs[th]->len);
-			skb_put(rx_ring->bufs[rh], tx_ring->bufs[th]->len);
-			engine_flip_addr(rx_ring->bufs[rh]);
+			engine_flip_addr(rx_ring->bufs[rh], tx_ring->bufs[th]->len);
 			rx_ring->desc[rh].len = tx_ring->desc[th].len;
 			rxp++;
 			rxb += rx_ring->desc[rh].len;
@@ -498,8 +523,13 @@ static int engine_thread(void *data)
 /* engine_flip_addr - loopback header rewrite: swap Ethernet src / dst (so
  * eth_type_trans() sees PACKET_HOST) and, for IPv4, swap the addresses and
  * rebuild the header checksum. Non-IPv4 (ARP, IPv6 ND) gets only the MAC swap.
+ *
+ * engine_run() calls this before skb_put(skb, len): skb_put() itself happens
+ * later, in the shared vnic_rx_poll(), so skb->len is still 0 here and can't
+ * be used to tell how much of the buffer is real frame data. @len is that
+ * same length, passed in directly instead.
  */
-static void engine_flip_addr(struct sk_buff *skb)
+static void engine_flip_addr(struct sk_buff *skb, u32 len)
 {
 	struct ethhdr *eth = (struct ethhdr *)skb->data;
 	u8 eth_tmp[ETH_ALEN];
@@ -509,7 +539,7 @@ static void engine_flip_addr(struct sk_buff *skb)
 	memcpy(eth->h_dest, eth_tmp, ETH_ALEN);
 
 	if (eth->h_proto == htons(ETH_P_IP) &&
-	    skb->len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+	    len >= sizeof(struct ethhdr) + sizeof(struct iphdr)) {
 		struct iphdr *iph = (struct iphdr *)(skb->data + sizeof(struct ethhdr));
 		u32 ip_tmp = iph->saddr;
 
@@ -533,6 +563,15 @@ static struct net_device *vnic_netdev;
  * once). __exit code lands in .exit.text, kept for rmmod but dropped entirely
  * if the kernel is built without module-unload support. module_init() pairs
  * with an __init function, module_exit() with __exit.
+ */
+
+/**
+ * vnic_engine_init() - module_init: build and register vnic0
+ *
+ * alloc_etherdev() the netdev, engine_create() the backend, register_netdev().
+ * On any failure, unwinds exactly what had already succeeded.
+ *
+ * Return: 0 on success, negative errno on failure.
  */
 static int __init vnic_engine_init(void)
 {
@@ -560,18 +599,10 @@ static int __init vnic_engine_init(void)
 		goto err_free_netdev;
 	}
 
-	ret = vnic_hal_ring_alloc(priv->hal, &priv->tx_ring, VNIC_TX_RING_SIZE);
-	if (ret)
-		goto err_destroy_hal;
-
-	ret = vnic_hal_ring_alloc(priv->hal, &priv->rx_ring, VNIC_RX_RING_SIZE);
-	if (ret)
-		goto err_free_tx_ring;
-
 	ret = register_netdev(netdev);
 	if (ret) {
 		netdev_err(netdev, "failed to register netdev: %d\n", ret);
-		goto err_free_rx_ring;
+		goto err_destroy_hal;
 	}
 
 	vnic_netdev = netdev;
@@ -579,10 +610,6 @@ static int __init vnic_engine_init(void)
 		    vnic_hal_rd32(priv->hal, VN_REG_ID));
 	return 0;
 
-err_free_rx_ring:
-	vnic_hal_ring_free(priv->hal, &priv->rx_ring);
-err_free_tx_ring:
-	vnic_hal_ring_free(priv->hal, &priv->tx_ring);
 err_destroy_hal:
 	engine_stop(priv->hal);
 	engine_destroy(priv->hal);
@@ -591,15 +618,19 @@ err_free_netdev:
 	return ret;
 }
 
-/* Only reached if vnic_engine_init() returned 0, so vnic_netdev is non-NULL. */
+/**
+ * vnic_engine_exit() - module_exit: tear vnic0 back down
+ *
+ * Only reached if vnic_engine_init() returned 0, so vnic_netdev is non-NULL.
+ * Reverse of vnic_engine_init(): unregister, stop the kthread, free the
+ * handle and rings, free the netdev.
+ */
 static void __exit vnic_engine_exit(void)
 {
 	struct vnic_priv *priv = netdev_priv(vnic_netdev);
 
 	unregister_netdev(vnic_netdev);
 	engine_stop(priv->hal);
-	vnic_hal_ring_free(priv->hal, &priv->rx_ring);
-	vnic_hal_ring_free(priv->hal, &priv->tx_ring);
 	engine_destroy(priv->hal);
 	free_netdev(vnic_netdev);
 }

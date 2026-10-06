@@ -20,13 +20,6 @@ struct vnic_ring;
 u32  vnic_hal_rd32(struct vnic_hal *hal, u32 off);
 void vnic_hal_wr32(struct vnic_hal *hal, u32 off, u32 val);
 
-/* raw write: a plain store into the register file, with none of the ICS/IMS/IMC
- * or TDT/RDT-doorbell side effects of vnic_hal_wr32(). Used only where a ring
- * cursor (TDH/TDT/RDH/RDT) is resynced without waking the engine (the drain
- * paths). A CTRL.TXEN/RXEN gate replaces it in Phase 3.
- */
-void vnic_hal_wr32_raw(struct vnic_hal *hal, u32 off, u32 val);
-
 /* descriptor-ring memory */
 int  vnic_hal_ring_alloc(struct vnic_hal *hal, struct vnic_ring *ring, u32 count);
 void vnic_hal_ring_free(struct vnic_hal *hal, struct vnic_ring *ring);

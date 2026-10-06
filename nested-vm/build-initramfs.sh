@@ -22,6 +22,8 @@ for ko in "${MODS[@]}"; do
 	cp "$ko" "$ROOT/$(basename "$ko")"
 done
 
+[ -x "$HERE/../driver/raw_flood" ] && cp "$HERE/../driver/raw_flood" "$ROOT/raw_flood"
+
 cat > "$ROOT/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox --install -s /bin

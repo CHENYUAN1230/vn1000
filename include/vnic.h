@@ -11,6 +11,7 @@
 #include <linux/netdevice.h>	/* struct net_device, napi_struct, net_device_ops */
 #include <linux/skbuff.h>	/* struct sk_buff */
 #include <linux/spinlock.h>	/* spinlock_t */
+#include <linux/types.h>	/* dma_addr_t */
 
 #include "vnic_regs.h"		/* struct vn_desc, VN_* register defs */
 
@@ -35,6 +36,9 @@ struct vnic_hal;		/* opaque: defined per backend in vnic-engine.c / vnic-pci.c *
 /**
  * struct vnic_ring - one TX or RX descriptor ring
  * @desc: array of @count descriptors (the device reads/writes these)
+ * @desc_dma: DMA (bus) address of @desc, as returned by dma_alloc_coherent();
+ *            this is what gets written into TDBAL/RDBAL etc, since the device
+ *            cannot use a CPU virtual address
  * @count: number of descriptors
  * @next_to_use: TX: value to write into TDT; RX: value to write into RDT
  * @next_to_clean: TX: reclaimed by vnic_tx_poll(), trails TDH;
@@ -45,6 +49,7 @@ struct vnic_hal;		/* opaque: defined per backend in vnic-engine.c / vnic-pci.c *
  */
 struct vnic_ring {
 	struct vn_desc *desc;
+	dma_addr_t desc_dma; // point to the address as same as ring->desc
 	u32 count;
 	u32 next_to_use;
 	u32 next_to_clean;

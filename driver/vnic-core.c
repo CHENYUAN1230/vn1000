@@ -39,12 +39,25 @@ static int vnic_change_mtu(struct net_device *dev, int new_mtu);
  * Open and close
  */
 
+/**
+ * vnic_open() - ndo_open: bring the interface up
+ * @dev: the network device
+ *
+ * Posts the RX ring with fresh skbs, arms the completion interrupt, enables
+ * NAPI, and unmasks the causes vnic_release() masked off. netif_start_queue()
+ * is last: nothing above this point can race a vnic_tx() that hasn't started
+ * yet.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
 static int vnic_open(struct net_device *dev)
 {
 	int ret;
 	struct vnic_priv *priv = netdev_priv(dev);
 
 	priv->rx_buf_size = dev->mtu + VN_FRAME_OVERHEAD; /* mtu might change */
+
+	vnic_hal_wr32(priv->hal, VN_REG_CTRL, VN_CTRL_TXEN | VN_CTRL_RXEN); /* open TX/RX gate */
 
 	ret = vnic_rx_post(priv);
 	if (ret)
@@ -57,8 +70,7 @@ static int vnic_open(struct net_device *dev)
 	PDEBUG("vnic_open: posted %u rx buffers, opening queue\n", priv->rx_ring.next_to_use);
 	napi_enable(&priv->napi);
 	/* re-arm: vnic_release() masked everything off */
-	vnic_hal_wr32(priv->hal, VN_REG_IMS,
-		      VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
+	vnic_hal_wr32(priv->hal, VN_REG_IMS, VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
 	netif_start_queue(dev);
 	return 0;
 
@@ -67,6 +79,17 @@ err_drain_rx:
 	return ret;
 }
 
+/**
+ * vnic_release() - ndo_stop: bring the interface down
+ * @dev: the network device
+ *
+ * Reverse of vnic_open(), in teardown order: stop new TX, disable NAPI
+ * (waits out any poll in progress), close the TX/RX gate and quiesce the
+ * backend (waits out any run in progress), free the interrupt, mask the
+ * causes, then sweep both rings unconditionally.
+ *
+ * Return: always 0.
+ */
 static int vnic_release(struct net_device *dev)
 {
 	struct vnic_priv *priv = netdev_priv(dev);
@@ -74,15 +97,18 @@ static int vnic_release(struct net_device *dev)
 	netif_tx_disable(dev); /* stop the queue and wait out any in-flight vnic_tx() */
 	PDEBUG("vnic_release: closing, draining rx ring\n");
 	napi_disable(&priv->napi); /* wait out any in-flight vnic_rx_poll() before draining */
-	/* At this point nothing can ring TDT/RDT again (TX disabled, NAPI disabled), so
-	 * this quiesce only has to wait out a run already in progress - no separate
-	 * enable flag needed to block a future one.
+	/* Close the TX/RX gate and reset the device's TDH/RDH in one write:
+	 * VN_CTRL_RST leaves TXEN/RXEN at 0 (same as writing plain 0 did) and
+	 * also asks the backend to zero its head cursors, self-clearing after.
+	 * Must come before quiesce(): its lock is what guarantees a later run
+	 * sees CTRL already cleared.
 	 */
+	vnic_hal_wr32(priv->hal, VN_REG_CTRL, VN_CTRL_RST);
 	vnic_hal_quiesce(priv->hal);
 	vnic_hal_irq_free(priv->hal); /* engine: tasklet_kill   pci: free_irq (engine parked, no run will reschedule) */
 	/* no poll left to re-arm IMS */
-	vnic_hal_wr32(priv->hal, VN_REG_IMC,
-		      VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
+	vnic_hal_wr32(priv->hal, VN_REG_IMC, VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
+
 	vnic_tx_drain(priv);
 	vnic_rx_drain(priv);
 
@@ -95,13 +121,16 @@ static int vnic_release(struct net_device *dev)
 static void vnic_tx_poll(struct vnic_priv *priv, int budget)
 {
 	struct vnic_ring *tx_ring = &priv->tx_ring;
+	struct sk_buff *skb;
 
 	spin_lock(&tx_ring->lock); /* NAPI runs in softirq context; no _bh against vnic_tx()'s spin_lock_bh() */
 	while (tx_ring->next_to_clean != tx_ring->next_to_use) {
 		if (!(READ_ONCE(tx_ring->desc[tx_ring->next_to_clean].status) & VN_DESC_DD))
 			break;
 		dma_rmb(); /* pairs with wmb() in engine_run() before it sets DD */
-		napi_consume_skb(tx_ring->bufs[tx_ring->next_to_clean], budget); /* normal completion, not an error drop */
+		skb = tx_ring->bufs[tx_ring->next_to_clean];
+		vnic_hal_unmap(priv->hal, tx_ring->desc[tx_ring->next_to_clean].addr, skb->len, DMA_TO_DEVICE);
+		napi_consume_skb(skb, budget); /* normal completion, not an error drop */
 		tx_ring->bufs[tx_ring->next_to_clean] = NULL;
 		dma_wmb(); /* bufs=NULL must be visible before the slot is freed */
 		WRITE_ONCE(tx_ring->desc[tx_ring->next_to_clean].status, 0);
@@ -138,8 +167,7 @@ static int vnic_tx_drain(struct vnic_priv *priv)
 	}
 	tx_ring->next_to_use = 0;
 	tx_ring->next_to_clean = 0;
-	vnic_hal_wr32_raw(priv->hal, VN_REG_TDH, 0); /* resync register cursor with software cursor */
-	vnic_hal_wr32_raw(priv->hal, VN_REG_TDT, 0); /* raw: no doorbell needed at close */
+	vnic_hal_wr32(priv->hal, VN_REG_TDT, 0); /* TDH already reset by CTRL_RST in vnic_release() */
 	spin_unlock_bh(&tx_ring->lock);
 	PDEBUG("vnic_tx_drain: freed %u tx buffers\n", drained);
 	return 0;
@@ -154,10 +182,18 @@ static int vnic_tx_drain(struct vnic_priv *priv)
 static int vnic_rx_buf_alloc(struct vnic_priv *priv, struct vnic_ring *rx_ring, u32 idx)
 {
 	struct sk_buff *skb = napi_alloc_skb(&priv->napi, priv->rx_buf_size);
+	dma_addr_t dma;
 
 	if (!skb)
 		return -ENOMEM;
-	rx_ring->desc[idx].addr = (u64)(unsigned long)skb->data;
+
+	dma = vnic_hal_map(priv->hal, skb->data, priv->rx_buf_size, DMA_FROM_DEVICE);
+	if (vnic_hal_mapping_error(priv->hal, dma)) {
+		dev_kfree_skb_any(skb);
+		return -ENOMEM;
+	}
+
+	rx_ring->desc[idx].addr = dma;
 	rx_ring->desc[idx].len = 0;
 	rx_ring->desc[idx].status = 0;
 	rx_ring->bufs[idx] = skb;
@@ -205,8 +241,7 @@ static int vnic_rx_drain(struct vnic_priv *priv)
 	}
 	rx_ring->next_to_use = 0;
 	rx_ring->next_to_clean = 0;
-	vnic_hal_wr32_raw(priv->hal, VN_REG_RDH, 0); /* resync register cursor with software cursor */
-	vnic_hal_wr32_raw(priv->hal, VN_REG_RDT, 0); /* raw: no doorbell needed at close */
+	vnic_hal_wr32(priv->hal, VN_REG_RDT, 0); /* RDH already reset by CTRL_RST in vnic_release() */
 	spin_unlock_bh(&rx_ring->lock);
 	PDEBUG("vnic_rx_drain: freed %u rx buffers\n", drained);
 	return 0;
@@ -235,10 +270,15 @@ static int vnic_rx_poll(struct vnic_priv *priv, int budget)
 
 		skb = rx_ring->bufs[ntc];
 		rx_ring->bufs[ntc] = NULL;
+		skb_put(skb, rx_ring->desc[ntc].len);
 		WRITE_ONCE(rx_ring->desc[ntc].status, 0); /* clear DD now, don't rely on the refill loop */
+		vnic_hal_unmap(priv->hal, rx_ring->desc[ntc].addr, priv->rx_buf_size, DMA_FROM_DEVICE);
 
 		skb->dev = priv->dev;
+		PDEBUG("vnic_rx_poll: dest_mac=%pM dev_addr=%pM\n",
+		       skb->data, priv->dev->dev_addr);
 		skb->protocol = eth_type_trans(skb, priv->dev);
+		PDEBUG("vnic_rx_poll: eth_type_trans pkt_type=%u\n", skb->pkt_type);
 		napi_gro_receive(&priv->napi, skb); /* deliver unconditionally; a later refill failure isn't this packet's fault */
 		ntc = (ntc + 1) % rx_ring->count;
 
@@ -264,8 +304,16 @@ static int vnic_rx_poll(struct vnic_priv *priv, int budget)
 	return skb_done;
 }
 
-/*
- * The NAPI poll. Non-static: the entry code passes it to netif_napi_add().
+/**
+ * vnic_poll() - the NAPI poll callback
+ * @napi: this netdev's napi_struct, embedded in struct vnic_priv
+ * @budget: max RX packets to deliver this call
+ *
+ * Non-static: the entry code (vnic-engine.c / vnic-pci.c) passes this to
+ * netif_napi_add(). Drains TX completions unconditionally, then RX up to
+ * @budget; re-arms the completion interrupts once both are caught up.
+ *
+ * Return: work done (RX packets delivered), capped at @budget.
  */
 int vnic_poll(struct napi_struct *napi, int budget)
 {
@@ -284,9 +332,15 @@ int vnic_poll(struct napi_struct *napi, int budget)
 	return work_done;
 }
 
-/*
- * Transmit a packet (called by the kernel: ndo_start_xmit)
- * push the skb into tx_ring
+/**
+ * vnic_tx() - ndo_start_xmit: queue a packet for transmit
+ * @skb: packet to send; this function takes ownership of it
+ * @dev: the network device
+ *
+ * Maps the payload, queues the descriptor, and rings the TX doorbell.
+ *
+ * Return: NETDEV_TX_OK (skb consumed, sent or dropped) or NETDEV_TX_BUSY
+ * (ring full; @skb is untouched, the stack will retry it).
  */
 static int vnic_tx(struct sk_buff *skb, struct net_device *dev)
 {
@@ -295,6 +349,7 @@ static int vnic_tx(struct sk_buff *skb, struct net_device *dev)
 	struct vnic_ring *tx_ring = &priv->tx_ring;
 	struct vn_desc *des = tx_ring->desc;
 	struct sk_buff **buf = tx_ring->bufs;
+	dma_addr_t dma;
 
 	spin_lock_bh(&tx_ring->lock); /* guards against vnic_tx_poll() running in softirq context */
 	if ((tx_ring->next_to_use + 1) % tx_ring->count == tx_ring->next_to_clean) { /* one slot reserved for full vs. empty */
@@ -313,10 +368,15 @@ static int vnic_tx(struct sk_buff *skb, struct net_device *dev)
 		goto out;
 	}
 
-	/* desc->addr points at the skb data; cast through unsigned long
-	 * (guaranteed pointer-width) before storing into the u64 desc->addr
-	 */
-	des[tx_ring->next_to_use].addr = (u64)(unsigned long)skb->data;
+	dma = vnic_hal_map(priv->hal, skb->data, skb->len, DMA_TO_DEVICE);
+	if (vnic_hal_mapping_error(priv->hal, dma)) {
+		dev->stats.tx_dropped++;
+		dev_kfree_skb_any(skb);   /* same reasoning as the skb_linearize() failure above */
+		ret = NETDEV_TX_OK;
+		goto out;
+	}
+
+	des[tx_ring->next_to_use].addr = dma;
 	des[tx_ring->next_to_use].len = skb->len;
 	des[tx_ring->next_to_use].status = 0; /* DD bit = 0, device-owned */
 
@@ -331,8 +391,16 @@ out:
 	return ret;
 }
 
-/*
- * Return statistics to the caller
+/**
+ * vnic_get_stats64() - ndo_get_stats64
+ * @dev: the network device
+ * @stats: output, filled in by this function
+ *
+ * Packet/byte counts come straight from the device's stat registers. Each
+ * drop count is two sources added together: the device's own count (frames
+ * it discarded, e.g. the loopback engine dropping an oversized frame) plus
+ * this driver's own count (e.g. a vnic_tx() skb_linearize() failure, which
+ * never reaches a descriptor and so never reaches the device's counter).
  */
 static void vnic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
@@ -347,9 +415,16 @@ static void vnic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *s
 	stats->tx_dropped = vnic_hal_rd32(priv->hal, VN_REG_STAT_TXDROP) + dev->stats.tx_dropped;
 }
 
-/*
- * The "change_mtu" method is usually not needed.
- * If you need it, it must be like this.
+/**
+ * vnic_change_mtu() - ndo_change_mtu
+ * @dev: the network device
+ * @new_mtu: requested MTU; already range-checked against dev->min_mtu/max_mtu
+ *
+ * Only allowed while the interface is down: changing rx_buf_size (and the
+ * device's MAXFRM) while skbs sized for the old MTU are already posted to
+ * the RX ring would desync the two.
+ *
+ * Return: 0 on success, -EBUSY if the interface is up.
  */
 static int vnic_change_mtu(struct net_device *dev, int new_mtu)
 {
@@ -360,6 +435,7 @@ static int vnic_change_mtu(struct net_device *dev, int new_mtu)
 
 	dev->mtu = new_mtu;
 	priv->rx_buf_size = dev->mtu + VN_FRAME_OVERHEAD;
+	vnic_hal_wr32(priv->hal, VN_REG_MAXFRM, priv->rx_buf_size); /* keep the device's frame-size limit in sync with MTU */
 
 	return 0;
 }

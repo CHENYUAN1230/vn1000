@@ -30,12 +30,17 @@ PWD       := $(shell pwd)
 default:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
+# plain userspace binary, no kbuild involved: static so it drops straight
+# into the nested-vm busybox initramfs with no interpreter/libs needed
+raw_flood: raw_flood.c
+	$(CC) -O2 -Wall -static -o $@ $<
+
 endif
 
 
 
 clean:
-	rm -rf *.o *~ core .depend .*.cmd *.ko *.mod.c .tmp_versions *.mod modules.order *.symvers
+	rm -rf *.o *~ core .depend .*.cmd *.ko *.mod.c .tmp_versions *.mod modules.order *.symvers raw_flood
 
 depend .depend dep:
 	$(CC) $(EXTRA_CFLAGS) -M *.c > .depend
