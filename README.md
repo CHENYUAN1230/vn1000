@@ -47,7 +47,7 @@ kthread, then against QEMU, with `vnic-core.c` unchanged.
 | 1 | HAL split: register/DMA seam extracted, engine + `ICR`/`ICS`/`IMS`/`IMC` semantics moved behind an in-kernel backend; datapath unchanged; prototype test suite re-runs green | **Done**, see [`test-logs/Phase1_test.md`](test-logs/Phase1_test.md) |
 | 2 | QEMU PCI device (QOM, vendor/device ID, BAR0 MMIO, `msi_init`) + `pci_driver` probe (`pcim_iomap`, `pci_alloc_irq_vectors` MSI, `request_irq`); self-built QEMU 9.1.3; `lspci` sees the device, `readl` reads it over real MMIO, a device-raised MSI reaches the ISR | **Done**, see [`test-logs/Phase2_test.md`](test-logs/Phase2_test.md) |
 | 3 | DMA datapath: `dma_alloc_coherent` rings, `dma_map_single` buffers, real MSI ISR → `napi_schedule`, `register_netdev`; QEMU device does IP-swap loopback internally so the full test methodology re-runs over real DMA/MMIO/MSI | **Done**, see [`test-logs/Phase3_test.md`](test-logs/Phase3_test.md) |
-| 4 | Real `tap` backend: device TX `qemu_send_packet`, RX `can_receive`/`receive`; ping guest ↔ host, `tcpdump` on the tap | Not started |
+| 4 | Real `tap` backend: device TX `qemu_send_packet`, RX `can_receive`/`receive`; ping guest ↔ host, `tcpdump` on the tap | **Done**, see [`test-logs/Phase4_test.md`](test-logs/Phase4_test.md) |
 | 5 | Finalize the netdev; prototype (`vnic_loop0`) and vn1000 (`vnic0`) loadable at once, distinct names, no subnet clash; real-peer test variant | Not started |
 | 6 | Polish: TX doorbell moderation, device-side ITR, MTU sweep, KASAN/lockdep/kmemleak gate on the DMA paths, docs/diagrams, demo | Not started |
 
@@ -113,6 +113,34 @@ non-interactively (insmods, dumps dmesg, powers off); more options (`KVM=1`,
 including the three bugs this phase's testing turned up, in
 [`test-logs/Phase3_test.md`](test-logs/Phase3_test.md).
 
+### Tap mode: a real host on the other end
+
+By default the device loops every frame back to the guest (`loopback=on`).
+With `loopback=off` it connects to a QEMU `-netdev` instead: TX frames go out
+to a tap interface on the host, and frames the host sends come back into the
+guest's RX ring. ARP and ping then work against the host's real network
+stack, no static neighbor entry needed.
+
+```bash
+cd nested-vm
+./setup-tap.sh                         # creates tap0 (10.1.0.2/24) for you; rerun after a host reboot
+./run.sh -netdev tap,id=n0,ifname=tap0,script=no,downscript=no \
+         -device vnic,loopback=off,netdev=n0
+```
+
+Inside the VM:
+
+```bash
+insmod /vnic.ko
+ip link set vnic0 up
+ip addr add 10.1.0.1/24 dev vnic0
+ping -c 5 10.1.0.2                     # the host
+```
+
+On the host, `ping 10.1.0.1` reaches the guest, and
+`sudo tcpdump -i tap0 -e -n` shows both directions. Full walkthrough in
+[`test-logs/Phase4_test.md`](test-logs/Phase4_test.md).
+
 ## Layout
 
 ```
@@ -126,6 +154,7 @@ include/vnic_regs.h       register / descriptor spec (shared with the QEMU devic
 driver/Makefile           out-of-tree kbuild Makefile
 driver/raw_flood.c        raw-socket flood helper for past-ring-capacity stress
 nested-vm/                scripts that boot a throwaway VM to test the PCI backend
+nested-vm/setup-tap.sh    creates the host's tap0 for tap mode
 test-logs/                per-phase test logs
 ```
 

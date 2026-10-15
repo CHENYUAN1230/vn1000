@@ -23,6 +23,7 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>		/* alloc_etherdev, eth_hw_addr_random */
 #include <linux/errno.h>
+#include <linux/dma-mapping.h>		/* dma_set_mask_and_coherent, DMA_BIT_MASK */
 
 #include "vnic.h"
 #include "vnic-hal.h"
@@ -291,6 +292,16 @@ static int vnic_pci_hal_create(struct vnic_priv *priv, struct pci_dev *pdev)
 	hal->mmio = pcim_iomap_table(pdev)[0];   /* the kernel virtual address for BAR0 */
 
 	pci_set_master(pdev);           /* bus-master enable: needed for MSI + DMA */
+
+	/* descriptors carry 64-bit addresses; fall back to 32-bit if the platform can't */
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (ret)
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	if (ret) {
+		dev_err(&pdev->dev, "no usable DMA mask\n");
+		goto err_free_hal;
+	}
+
 	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);   /* exactly 1 vector, MSI only */
 	if (ret < 0)                            /* success returns the count (1), not 0 */
 		goto err_free_hal;

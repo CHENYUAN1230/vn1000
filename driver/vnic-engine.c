@@ -447,8 +447,9 @@ static void engine_run(struct vnic_hal *hal)
 	rt = vnic_hal_rd32(hal, VN_REG_RDT);
 	rh_start = rh;
 
-	while (th != tt && rh != rt) { /* one slot reserved for full vs. empty */
-		if (READ_ONCE(rx_ring->desc[rh].status) & VN_DESC_DD) {
+	while (th != tt) {
+		/* no posted buffer (rh == rt) or not yet consumed (DD): RXEMPTY */
+		if (rh == rt || (READ_ONCE(rx_ring->desc[rh].status) & VN_DESC_DD)) {
 			PDEBUG("engine_run: rx ring full at rh=%u, stalling th=%u\n", rh, th);
 			vnic_hal_wr32(hal, VN_REG_ICS, VN_INT_RXEMPTY);
 			break;

@@ -31,7 +31,7 @@ mount -t proc     none /proc
 mount -t sysfs    none /sys
 mount -t devtmpfs none /dev
 echo
-echo "=== nested VM: vn1000 phase 2 test shell ==="
+echo "=== nested VM: vn1000 test shell ==="
 echo "--- PCI devices (vendor:device) ---"
 for d in /sys/bus/pci/devices/*/; do
 	printf '%s  %s:%s  class %s\n' "$(basename "$d")" \
