@@ -21,7 +21,7 @@
 #include <linux/kernel.h>		/* lower_32_bits, upper_32_bits */
 #include <linux/string.h>		/* strscpy */
 #include <linux/netdevice.h>
-#include <linux/etherdevice.h>		/* alloc_etherdev, eth_hw_addr_random */
+#include <linux/etherdevice.h>		/* alloc_etherdev, eth_hw_addr_set/random */
 #include <linux/errno.h>
 #include <linux/dma-mapping.h>		/* dma_set_mask_and_coherent, DMA_BIT_MASK */
 
@@ -317,19 +317,14 @@ static int vnic_pci_hal_create(struct vnic_priv *priv, struct pci_dev *pdev)
 	hal->priv = priv;
 	priv->hal = hal;
 
+	/* ring bases are written to the device in vnic_open(), after any reset */
 	ret = vnic_hal_ring_alloc(hal, &priv->tx_ring, VNIC_TX_RING_SIZE);
 	if (ret)
 		goto err_free_hal;
-	vnic_hal_wr32(hal, VN_REG_TDBAL, lower_32_bits(priv->tx_ring.desc_dma));
-	vnic_hal_wr32(hal, VN_REG_TDBAH, upper_32_bits(priv->tx_ring.desc_dma));
-	vnic_hal_wr32(hal, VN_REG_TDLEN, priv->tx_ring.count * sizeof(struct vn_desc));
 
 	ret = vnic_hal_ring_alloc(hal, &priv->rx_ring, VNIC_RX_RING_SIZE);
 	if (ret)
 		goto err_free_tx_ring;
-	vnic_hal_wr32(hal, VN_REG_RDBAL, lower_32_bits(priv->rx_ring.desc_dma));
-	vnic_hal_wr32(hal, VN_REG_RDBAH, upper_32_bits(priv->rx_ring.desc_dma));
-	vnic_hal_wr32(hal, VN_REG_RDLEN, priv->rx_ring.count * sizeof(struct vn_desc));
 
 	return 0;
 
@@ -360,12 +355,36 @@ static void vnic_pci_hal_destroy(struct vnic_priv *priv)
 }
 
 /**
+ * vnic_pci_read_mac - take the MAC address the device holds
+ * @netdev: the network device
+ * @hal:    backend handle, BAR0 already mapped
+ *
+ * The device loads MAC_LO/MAC_HI with AV set at power-on; read them once at
+ * probe. Falls back to a random address if AV is clear or the address is
+ * not a valid unicast one.
+ */
+static void vnic_pci_read_mac(struct net_device *netdev, struct vnic_hal *hal)
+{
+	u32 lo = vnic_hal_rd32(hal, VN_REG_MAC_LO);
+	u32 hi = vnic_hal_rd32(hal, VN_REG_MAC_HI);
+	u8 mac[ETH_ALEN] = { lo, lo >> 8, lo >> 16, lo >> 24, hi, hi >> 8 };
+
+	if ((hi & VN_MAC_HI_AV) && is_valid_ether_addr(mac)) {
+		eth_hw_addr_set(netdev, mac);
+	} else {
+		dev_warn(&hal->pdev->dev, "no valid MAC in the device, using a random one\n");
+		eth_hw_addr_random(netdev);
+	}
+}
+
+/**
  * vnic_pci_probe - the bus enumerated a 1234:11e9 device
  * @pdev: the PCI device
  * @id:   the matching vnic_pci_ids[] entry
  *
  * alloc_etherdev() first, the vnic-engine.c shape. vnic_pci_hal_create() then
- * brings the hardware up and wires priv->hal; register_netdev() last.
+ * brings the hardware up and wires priv->hal, the MAC is read from the
+ * device, and register_netdev() comes last.
  *
  * Return: 0 on success, negative errno on failure.
  */
@@ -381,7 +400,6 @@ static int vnic_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	strscpy(netdev->name, "vnic%d", sizeof(netdev->name));
 	netdev->netdev_ops = &vnic_netdev_ops;
-	eth_hw_addr_random(netdev);
 	netdev->min_mtu = VN_MTU_MIN;
 	netdev->max_mtu = VN_MTU_MAX;
 
@@ -394,6 +412,8 @@ static int vnic_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = vnic_pci_hal_create(priv, pdev);
 	if (ret)
 		goto err_free_netdev;
+
+	vnic_pci_read_mac(netdev, priv->hal);
 
 	ret = register_netdev(netdev);
 	if (ret) {

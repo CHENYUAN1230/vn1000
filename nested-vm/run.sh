@@ -9,8 +9,13 @@
 #
 #   ./run.sh -device vnic
 #   TEST=1 ./run.sh -device vnic         # non-interactive: insmod + dmesg + poweroff
+#   TEST=tap ...                         # guest half of test-tap.sh (run that instead)
 #   KVM=1  ./run.sh -device vnic         # needs: sudo usermod -aG kvm $USER
 #   QEMU_BIN=/path/to/qemu-system-x86_64 ./run.sh -device vnic
+#
+# -nic none stops QEMU from adding its default NIC, so the VN1000 is always
+# at 00:02.0 with the default MAC 52:54:00:12:34:56. Add other NICs
+# explicitly with -netdev/-device if a test needs them.
 #
 # Ctrl-a x   quits qemu.   The guest poweroffs on 'poweroff' or shell exit.
 set -euo pipefail
@@ -26,12 +31,12 @@ ACCEL=(-accel tcg)
 [ "${KVM:-0}" = "1" ] && ACCEL=(-accel kvm -cpu host)
 
 CMDLINE="console=ttyS0 panic=-1 rdinit=/init"
-[ "${TEST:-0}" = "1" ] && CMDLINE="$CMDLINE vn1000.test=1"   # insmod + dmesg + poweroff
+[ -n "${TEST:-}" ] && CMDLINE="$CMDLINE vn1000.test=$TEST"   # picks a test branch in /init
 
 exec "$QEMU" \
 	-M q35 "${ACCEL[@]}" -m 512 -smp 2 \
 	-kernel "$HERE/vmlinuz" \
 	-initrd "$HERE/initramfs.cpio.gz" \
 	-append "$CMDLINE" \
-	-nographic -no-reboot \
+	-nographic -no-reboot -nic none \
 	"$@"

@@ -320,6 +320,32 @@ static void vnic_run(VNICState *s)
 }
 
 /* ---------------------------------------------------------------------------
+ * reset
+ * ------------------------------------------------------------------------- */
+
+/**
+ * vnic_reset - return the device to its power-on state
+ * @s: device state
+ *
+ * Zeroes the register file, then reseeds the read-only identity registers,
+ * the default MAXFRM, and the MAC from conf.macaddr with AV set (the
+ * device's "EEPROM"). Used for CTRL.RST and for a QEMU system reset. The
+ * driver reprograms everything else on open.
+ */
+static void vnic_reset(VNICState *s)
+{
+    const uint8_t *mac = s->conf.macaddr.a;
+
+    memset(s->regs, 0, sizeof(s->regs));
+    s->regs[VN_REG_ID / 4]      = VN_ID_MAGIC;
+    s->regs[VN_REG_VERSION / 4] = VN_VERSION_1_0;
+    s->regs[VN_REG_CAP / 4]     = VN_CAP_MSI;
+    s->regs[VN_REG_MAXFRM / 4]  = VN_MAXFRM_DEFAULT;
+    s->regs[VN_REG_MAC_LO / 4]  = mac[0] | mac[1] << 8 | mac[2] << 16 | (uint32_t)mac[3] << 24;
+    s->regs[VN_REG_MAC_HI / 4]  = mac[4] | mac[5] << 8 | VN_MAC_HI_AV;
+}
+
+/* ---------------------------------------------------------------------------
  * BAR0 MMIO
  *
  * These two callbacks ARE the register semantics. The guest driver's readl() on
@@ -405,9 +431,8 @@ static void vnic_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         bool rx_was_on = s->regs[VN_REG_CTRL / 4] & VN_CTRL_RXEN;
 
         if (val & VN_CTRL_RST) {
-            s->regs[VN_REG_TDH / 4] = 0;
-            s->regs[VN_REG_RDH / 4] = 0;
-            val &= ~VN_CTRL_RST;                     /* self-clearing */
+            vnic_reset(s);                           /* other bits ignored; RST self-clears */
+            break;
         }
         s->regs[VN_REG_CTRL / 4] = val;
         if (!s->loopback && !rx_was_on && (val & VN_CTRL_RXEN))
@@ -525,9 +550,9 @@ static NetClientInfo vnic_net_info = {
  * @pdev: the embedded PCIDevice; VNIC() back to the VNICState
  * @errp: error sink; on failure the callee sets it and we return
  *
- * Sets up BAR0 (the MMIO region), one MSI vector, the RO identity
- * registers, and the net client peered with the netdev= backend. PCI config
- * space (vendor/device/class) is done in class_init.
+ * Sets up BAR0 (the MMIO region), one MSI vector, the net client peered
+ * with the netdev= backend, and the power-on registers (vnic_reset()). PCI
+ * config space (vendor/device/class) is done in class_init.
  */
 static void vnic_realize(PCIDevice *pdev, Error **errp)
 {
@@ -544,21 +569,15 @@ static void vnic_realize(PCIDevice *pdev, Error **errp)
     if (ret < 0)
         return;              /* errp already set by msi_init() */
 
-    /* RO identity registers; CAP advertises MSI */
-    s->regs[VN_REG_ID / 4]      = VN_ID_MAGIC;
-    s->regs[VN_REG_VERSION / 4] = VN_VERSION_1_0;
-    s->regs[VN_REG_CAP / 4]     = VN_CAP_MSI;
-
-    /* default frame-size limit; vnic_change_mtu() keeps it in sync with MTU */
-    s->regs[VN_REG_MAXFRM / 4] = VN_MAXFRM_DEFAULT;
-
-    /* default MAC if no mac=; the driver does not read it yet */
+    /* default MAC if no mac=; vnic_reset() loads it into MAC_LO/MAC_HI */
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
 
     /* create our net client and peer it with the netdev= backend */
     s->nic = qemu_new_nic(&vnic_net_info, &s->conf, object_get_typename(OBJECT(s)),
                           dev->id, &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+
+    vnic_reset(s);   /* power-on registers; a system reset repeats this */
 }
 
 /**
@@ -571,6 +590,19 @@ static void vnic_unrealize(PCIDevice *pdev)
 
     qemu_del_nic(s->nic);   /* unpeer from the backend and free the net client */
     msi_uninit(pdev);       /* the MemoryRegion is owned by OBJECT(s), freed with it */
+}
+
+/**
+ * vnic_reset_hold() - QEMU system reset (machine start, guest reboot)
+ * @obj: the device object
+ * @type: reset type; every type is handled the same way here
+ *
+ * Without this a guest reboot would leave CTRL and the old ring bases in
+ * place, and the device could DMA into memory the new kernel now owns.
+ */
+static void vnic_reset_hold(Object *obj, ResetType type)
+{
+    vnic_reset(VNIC(obj));
 }
 
 /* ---------------------------------------------------------------------------
@@ -601,7 +633,9 @@ static void vnic_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass    *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k  = PCI_DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
+    rc->phases.hold = vnic_reset_hold;
     k->realize   = vnic_realize;
     k->exit      = vnic_unrealize;
     k->vendor_id = VN_PCI_VENDOR_ID;

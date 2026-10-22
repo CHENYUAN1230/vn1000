@@ -32,21 +32,54 @@ static int vnic_rx_post(struct vnic_priv *priv);
 static int vnic_rx_drain(struct vnic_priv *priv);
 static int vnic_rx_poll(struct vnic_priv *priv, int budget);
 static int vnic_tx(struct sk_buff *skb, struct net_device *dev);
+static int vnic_init(struct net_device *dev);
+static void vnic_stats_update(struct vnic_priv *priv);
+static void vnic_stats_resync(struct vnic_priv *priv);
 static void vnic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats);
 static int vnic_change_mtu(struct net_device *dev, int new_mtu);
+
+#define VNIC_STATS_PERIOD	HZ	/* well inside the fastest 32-bit wrap (~9 s at 3.7 Gbit/s) */
 
 /*
  * Open and close
  */
 
 /**
+ * vnic_hw_config() - program the device from the driver's own state
+ * @priv: driver private data
+ *
+ * Writes everything a device reset may have cleared: ring bases and
+ * lengths, MAXFRM, and the MAC (dev_addr is the source of truth). Called on
+ * every open, before the TX/RX gate opens, so nothing depends on what the
+ * device kept across a reset.
+ */
+static void vnic_hw_config(struct vnic_priv *priv)
+{
+	const u8 *mac = priv->dev->dev_addr;
+
+	vnic_hal_wr32(priv->hal, VN_REG_TDBAL, lower_32_bits(priv->tx_ring.desc_dma));
+	vnic_hal_wr32(priv->hal, VN_REG_TDBAH, upper_32_bits(priv->tx_ring.desc_dma));
+	vnic_hal_wr32(priv->hal, VN_REG_TDLEN, priv->tx_ring.count * sizeof(struct vn_desc));
+
+	vnic_hal_wr32(priv->hal, VN_REG_RDBAL, lower_32_bits(priv->rx_ring.desc_dma));
+	vnic_hal_wr32(priv->hal, VN_REG_RDBAH, upper_32_bits(priv->rx_ring.desc_dma));
+	vnic_hal_wr32(priv->hal, VN_REG_RDLEN, priv->rx_ring.count * sizeof(struct vn_desc));
+
+	vnic_hal_wr32(priv->hal, VN_REG_MAXFRM, priv->rx_buf_size);
+
+	/* datasheet 4.6: MAC_LO first, MAC_HI with AV last */
+	vnic_hal_wr32(priv->hal, VN_REG_MAC_LO, mac[0] | mac[1] << 8 | mac[2] << 16 | (u32)mac[3] << 24);
+	vnic_hal_wr32(priv->hal, VN_REG_MAC_HI, mac[4] | mac[5] << 8 | VN_MAC_HI_AV);
+}
+
+/**
  * vnic_open() - ndo_open: bring the interface up
  * @dev: the network device
  *
- * Posts the RX ring with fresh skbs, arms the completion interrupt, enables
- * NAPI, and unmasks the causes vnic_release() masked off. netif_start_queue()
- * is last: nothing above this point can race a vnic_tx() that hasn't started
- * yet.
+ * Programs the device (vnic_hw_config()), opens the TX/RX gate, posts the RX
+ * ring with fresh skbs, arms the completion interrupt, enables NAPI, and
+ * unmasks the causes vnic_release() masked off. netif_start_queue() is last:
+ * nothing above this point can race a vnic_tx() that hasn't started yet.
  *
  * Return: 0 on success, negative errno on failure.
  */
@@ -57,6 +90,7 @@ static int vnic_open(struct net_device *dev)
 
 	priv->rx_buf_size = dev->mtu + VN_FRAME_OVERHEAD; /* mtu might change */
 
+	vnic_hw_config(priv);
 	vnic_hal_wr32(priv->hal, VN_REG_CTRL, VN_CTRL_TXEN | VN_CTRL_RXEN); /* open TX/RX gate */
 
 	ret = vnic_rx_post(priv);
@@ -71,6 +105,7 @@ static int vnic_open(struct net_device *dev)
 	napi_enable(&priv->napi);
 	/* re-arm: vnic_release() masked everything off */
 	vnic_hal_wr32(priv->hal, VN_REG_IMS, VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
+	schedule_delayed_work(&priv->stats.work, VNIC_STATS_PERIOD);
 	netif_start_queue(dev);
 	return 0;
 
@@ -83,10 +118,11 @@ err_drain_rx:
  * vnic_release() - ndo_stop: bring the interface down
  * @dev: the network device
  *
- * Reverse of vnic_open(), in teardown order: stop new TX, disable NAPI
- * (waits out any poll in progress), close the TX/RX gate and quiesce the
- * backend (waits out any run in progress), free the interrupt, mask the
- * causes, then sweep both rings unconditionally.
+ * Reverse of vnic_open(), in teardown order: stop the stats work and new TX,
+ * disable NAPI (waits out any poll in progress), close the TX/RX gate and
+ * quiesce the backend (waits out any run in progress), collect the final
+ * counter deltas, reset the device, free the interrupt, mask the causes,
+ * then sweep both rings unconditionally.
  *
  * Return: always 0.
  */
@@ -94,17 +130,21 @@ static int vnic_release(struct net_device *dev)
 {
 	struct vnic_priv *priv = netdev_priv(dev);
 
+	cancel_delayed_work_sync(&priv->stats.work);
 	netif_tx_disable(dev); /* stop the queue and wait out any in-flight vnic_tx() */
 	PDEBUG("vnic_release: closing, draining rx ring\n");
 	napi_disable(&priv->napi); /* wait out any in-flight vnic_rx_poll() before draining */
-	/* Close the TX/RX gate and reset the device's TDH/RDH in one write:
-	 * VN_CTRL_RST leaves TXEN/RXEN at 0 (same as writing plain 0 did) and
-	 * also asks the backend to zero its head cursors, self-clearing after.
-	 * Must come before quiesce(): its lock is what guarantees a later run
-	 * sees CTRL already cleared.
+	/* Close the TX/RX gate. Must come before quiesce(): its lock is what
+	 * guarantees a later run sees CTRL already cleared.
 	 */
-	vnic_hal_wr32(priv->hal, VN_REG_CTRL, VN_CTRL_RST);
+	vnic_hal_wr32(priv->hal, VN_REG_CTRL, 0);
 	vnic_hal_quiesce(priv->hal);
+	/* device stopped, counters final: collect them before the reset can
+	 * clear them, then zero TDH/RDH (RST self-clears)
+	 */
+	vnic_stats_update(priv);
+	vnic_hal_wr32(priv->hal, VN_REG_CTRL, VN_CTRL_RST);
+	vnic_stats_resync(priv);
 	vnic_hal_irq_free(priv->hal); /* engine: tasklet_kill   pci: free_irq (engine parked, no run will reschedule) */
 	/* no poll left to re-arm IMS */
 	vnic_hal_wr32(priv->hal, VN_REG_IMC, VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
@@ -391,28 +431,111 @@ out:
 	return ret;
 }
 
+/*
+ * Statistics: the device's STAT_* registers are 32-bit and cleared by a
+ * device reset, so the driver keeps 64-bit totals and adds the u32 delta
+ * since its previous read (correct across one wrap of the register).
+ */
+
+static const u32 vnic_stat_regs[VNIC_NSTATS] = {
+	[VNIC_STAT_TXPKTS]  = VN_REG_STAT_TXPKTS,
+	[VNIC_STAT_TXBYTES] = VN_REG_STAT_TXBYTES,
+	[VNIC_STAT_RXPKTS]  = VN_REG_STAT_RXPKTS,
+	[VNIC_STAT_RXBYTES] = VN_REG_STAT_RXBYTES,
+	[VNIC_STAT_TXDROP]  = VN_REG_STAT_TXDROP,
+	[VNIC_STAT_RXDROP]  = VN_REG_STAT_RXDROP,
+};
+
+/**
+ * vnic_stats_update() - fold the device counters into the 64-bit totals
+ * @priv: driver private data
+ *
+ * Called periodically, from vnic_get_stats64(), and right before a reset.
+ */
+static void vnic_stats_update(struct vnic_priv *priv)
+{
+	struct vnic_stats *s = &priv->stats;
+	int i;
+
+	spin_lock_bh(&s->lock);
+	for (i = 0; i < VNIC_NSTATS; i++) {
+		u32 now = vnic_hal_rd32(priv->hal, vnic_stat_regs[i]);
+
+		s->total[i] += (u32)(now - s->last[i]);
+		s->last[i] = now;
+	}
+	spin_unlock_bh(&s->lock);
+}
+
+/**
+ * vnic_stats_resync() - restart the deltas from the registers' current values
+ * @priv: driver private data
+ *
+ * Called after a reset, or before any counting is ours (vnic_init()). Reads
+ * the registers instead of assuming a reset zeroed them.
+ */
+static void vnic_stats_resync(struct vnic_priv *priv)
+{
+	struct vnic_stats *s = &priv->stats;
+	int i;
+
+	spin_lock_bh(&s->lock);
+	for (i = 0; i < VNIC_NSTATS; i++)
+		s->last[i] = vnic_hal_rd32(priv->hal, vnic_stat_regs[i]);
+	spin_unlock_bh(&s->lock);
+}
+
+/* periodic read while the interface is up */
+static void vnic_stats_work(struct work_struct *work)
+{
+	struct vnic_priv *priv = container_of(to_delayed_work(work), struct vnic_priv, stats.work);
+
+	vnic_stats_update(priv);
+	schedule_delayed_work(&priv->stats.work, VNIC_STATS_PERIOD);
+}
+
+/**
+ * vnic_init() - ndo_init: called by register_netdev()
+ * @dev: the network device
+ *
+ * Sets up the stats; priv->hal is already valid here in both backends.
+ *
+ * Return: always 0.
+ */
+static int vnic_init(struct net_device *dev)
+{
+	struct vnic_priv *priv = netdev_priv(dev);
+
+	spin_lock_init(&priv->stats.lock);
+	INIT_DELAYED_WORK(&priv->stats.work, vnic_stats_work);
+	vnic_stats_resync(priv);
+	return 0;
+}
+
 /**
  * vnic_get_stats64() - ndo_get_stats64
  * @dev: the network device
  * @stats: output, filled in by this function
  *
- * Packet/byte counts come straight from the device's stat registers. Each
- * drop count is two sources added together: the device's own count (frames
- * it discarded, e.g. the loopback engine dropping an oversized frame) plus
- * this driver's own count (e.g. a vnic_tx() skb_linearize() failure, which
- * never reaches a descriptor and so never reaches the device's counter).
+ * Reports the 64-bit totals after folding in the latest deltas. Each drop
+ * count also adds this driver's own count (e.g. a vnic_tx()
+ * skb_linearize() failure, which never reaches the device's counter).
  */
 static void vnic_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	struct vnic_priv *priv = netdev_priv(dev);
+	struct vnic_stats *s = &priv->stats;
 
-	stats->rx_packets = vnic_hal_rd32(priv->hal, VN_REG_STAT_RXPKTS);
-	stats->tx_packets = vnic_hal_rd32(priv->hal, VN_REG_STAT_TXPKTS);
-	stats->rx_bytes   = vnic_hal_rd32(priv->hal, VN_REG_STAT_RXBYTES);
-	stats->tx_bytes   = vnic_hal_rd32(priv->hal, VN_REG_STAT_TXBYTES);
-	/* driver-side drop (e.g. skb_linearize() failure) + device-side drop */
-	stats->rx_dropped = vnic_hal_rd32(priv->hal, VN_REG_STAT_RXDROP) + dev->stats.rx_dropped;
-	stats->tx_dropped = vnic_hal_rd32(priv->hal, VN_REG_STAT_TXDROP) + dev->stats.tx_dropped;
+	vnic_stats_update(priv);
+
+	spin_lock_bh(&s->lock);
+	stats->tx_packets = s->total[VNIC_STAT_TXPKTS];
+	stats->tx_bytes   = s->total[VNIC_STAT_TXBYTES];
+	stats->rx_packets = s->total[VNIC_STAT_RXPKTS];
+	stats->rx_bytes   = s->total[VNIC_STAT_RXBYTES];
+	stats->tx_dropped = s->total[VNIC_STAT_TXDROP] + dev->stats.tx_dropped;
+	stats->rx_dropped = s->total[VNIC_STAT_RXDROP] + dev->stats.rx_dropped;
+	spin_unlock_bh(&s->lock);
 }
 
 /**
@@ -442,6 +565,7 @@ static int vnic_change_mtu(struct net_device *dev, int new_mtu)
 
 /* Non-static: the entry code assigns this to netdev->netdev_ops. */
 const struct net_device_ops vnic_netdev_ops = {
+	.ndo_init		= vnic_init,
 	.ndo_open		= vnic_open,
 	.ndo_stop		= vnic_release,
 	.ndo_start_xmit		= vnic_tx,

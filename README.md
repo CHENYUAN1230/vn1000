@@ -48,7 +48,7 @@ kthread, then against QEMU, with `vnic-core.c` unchanged.
 | 2 | QEMU PCI device (QOM, vendor/device ID, BAR0 MMIO, `msi_init`) + `pci_driver` probe (`pcim_iomap`, `pci_alloc_irq_vectors` MSI, `request_irq`); self-built QEMU 9.1.3; `lspci` sees the device, `readl` reads it over real MMIO, a device-raised MSI reaches the ISR | **Done**, see [`test-logs/Phase2_test.md`](test-logs/Phase2_test.md) |
 | 3 | DMA datapath: `dma_alloc_coherent` rings, `dma_map_single` buffers, real MSI ISR → `napi_schedule`, `register_netdev`; QEMU device does IP-swap loopback internally so the full test methodology re-runs over real DMA/MMIO/MSI | **Done**, see [`test-logs/Phase3_test.md`](test-logs/Phase3_test.md) |
 | 4 | Real `tap` backend: device TX `qemu_send_packet`, RX `can_receive`/`receive`; ping guest ↔ host, `tcpdump` on the tap | **Done**, see [`test-logs/Phase4_test.md`](test-logs/Phase4_test.md) |
-| 5 | Finalize the netdev; prototype (`vnic_loop0`) and vn1000 (`vnic0`) loadable at once, distinct names, no subnet clash; real-peer test variant | Not started |
+| 5 | Finalize the netdev: full device reset (`CTRL.RST` and QEMU system reset return the device to power-on state, the driver reprograms it on every open); a stable MAC loaded from the device (`MAC_LO`/`MAC_HI`); 64-bit software-accumulated stats; a repeatable tap-mode test script | **Done**, see [`test-logs/Phase5_test.md`](test-logs/Phase5_test.md) |
 | 6 | Polish: TX doorbell moderation, device-side ITR, MTU sweep, KASAN/lockdep/kmemleak gate on the DMA paths, docs/diagrams, demo | Not started |
 
 ## Building and loading
@@ -138,8 +138,23 @@ ping -c 5 10.1.0.2                     # the host
 ```
 
 On the host, `ping 10.1.0.1` reaches the guest, and
-`sudo tcpdump -i tap0 -e -n` shows both directions. Full walkthrough in
+`sudo tcpdump -i tap0 -e -n` shows both directions. `vnic0`'s MAC comes from
+the device, `52:54:00:12:34:56` unless `-device vnic,mac=...` sets another,
+so it stays the same across guest reboots. Full walkthrough in
 [`test-logs/Phase4_test.md`](test-logs/Phase4_test.md).
+
+The same checks run as one command, which boots the VM, drives both sides,
+and prints a PASS/FAIL line per check (exit status 0 only if all pass):
+
+```bash
+cd nested-vm
+./test-tap.sh                          # needs the PCI build packed by build-initramfs.sh; uses sudo
+```
+
+It covers ping both ways, the guest's interface going down and up, a flood
+from the host, the host's neighbor entry for the guest's MAC, and a backlog
+of frames queued while the guest is down. See
+[`test-logs/Phase5_test.md`](test-logs/Phase5_test.md).
 
 ## Layout
 
@@ -155,6 +170,7 @@ driver/Makefile           out-of-tree kbuild Makefile
 driver/raw_flood.c        raw-socket flood helper for past-ring-capacity stress
 nested-vm/                scripts that boot a throwaway VM to test the PCI backend
 nested-vm/setup-tap.sh    creates the host's tap0 for tap mode
+nested-vm/test-tap.sh     automated tap-mode test (host and guest halves)
 test-logs/                per-phase test logs
 ```
 

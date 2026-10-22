@@ -93,6 +93,23 @@ u32 vnic_hal_rd32(struct vnic_hal *hal, u32 off)
 }
 
 /**
+ * engine_reset_regs() - return the register file to its power-on state
+ * @hal: backend handle
+ *
+ * Mirrors the QEMU device's vnic_reset(), minus the MAC: the engine has no
+ * stored address, so MAC_LO/MAC_HI stay 0 with AV clear. Caller holds
+ * reg_lock, or nothing else can touch the registers yet (engine_create()).
+ */
+static void engine_reset_regs(struct vnic_hal *hal)
+{
+	memset(hal->regs, 0, sizeof(hal->regs));
+	hal->regs[VN_REG_ID / 4]      = VN_ID_MAGIC;
+	hal->regs[VN_REG_VERSION / 4] = VN_VERSION_1_0;
+	hal->regs[VN_REG_CAP / 4]     = VN_CAP_MSI | VN_CAP_MODER;
+	hal->regs[VN_REG_MAXFRM / 4]  = VN_MAXFRM_DEFAULT;
+}
+
+/**
  * vnic_hal_wr32() - write a 32-bit device register
  * @hal: backend handle
  * @off: register byte offset (VN_REG_*)
@@ -100,8 +117,8 @@ u32 vnic_hal_rd32(struct vnic_hal *hal, u32 off)
  *
  * The core's only path to a register write, emulating what real hardware does
  * on the bus write: ICS ORs into ICR; IMS / IMC set / clear the interrupt
- * mask; CTRL.RST zeroes TDH/RDH and self-clears; TDT / RDT ring the doorbell
- * and wake the engine; anything else is a plain store.
+ * mask; CTRL.RST resets the register file (engine_reset_regs()); TDT / RDT
+ * ring the doorbell and wake the engine; anything else is a plain store.
  */
 void vnic_hal_wr32(struct vnic_hal *hal, u32 off, u32 val)
 {
@@ -121,12 +138,10 @@ void vnic_hal_wr32(struct vnic_hal *hal, u32 off, u32 val)
 		spin_unlock_irqrestore(&hal->reg_lock, flags);
 	} else if (off == VN_REG_CTRL) {
 		spin_lock_irqsave(&hal->reg_lock, flags);
-		if (val & VN_CTRL_RST) {
-			hal->regs[VN_REG_TDH / 4] = 0;
-			hal->regs[VN_REG_RDH / 4] = 0;
-			val &= ~VN_CTRL_RST;        /* self-clearing */
-		}
-		hal->regs[VN_REG_CTRL / 4] = val;
+		if (val & VN_CTRL_RST)
+			engine_reset_regs(hal);     /* other bits ignored; RST self-clears */
+		else
+			hal->regs[VN_REG_CTRL / 4] = val;
 		spin_unlock_irqrestore(&hal->reg_lock, flags);
 	} else {
 		hal->regs[off / 4] = val;
@@ -316,10 +331,8 @@ static struct vnic_hal *engine_create(struct vnic_priv *priv)
 	mutex_init(&hal->run_lock);
 	init_waitqueue_head(&hal->wq);
 
-	/* RO identity + initial interrupt mask, before the engine ever runs */
-	vnic_hal_wr32(hal, VN_REG_ID, VN_ID_MAGIC);
-	vnic_hal_wr32(hal, VN_REG_VERSION, VN_VERSION_1_0);
-	vnic_hal_wr32(hal, VN_REG_CAP, VN_CAP_MSI | VN_CAP_MODER);
+	/* power-on registers + initial interrupt mask, before the engine ever runs */
+	engine_reset_regs(hal);
 	vnic_hal_wr32(hal, VN_REG_IMS,
 		      VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
 

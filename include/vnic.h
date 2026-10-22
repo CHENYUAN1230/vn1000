@@ -12,6 +12,7 @@
 #include <linux/skbuff.h>	/* struct sk_buff */
 #include <linux/spinlock.h>	/* spinlock_t */
 #include <linux/types.h>	/* dma_addr_t */
+#include <linux/workqueue.h>	/* struct delayed_work */
 
 #include "vnic_regs.h"		/* struct vn_desc, VN_* register defs */
 
@@ -57,6 +58,31 @@ struct vnic_ring {
 	struct sk_buff **bufs;
 };
 
+/* the device's 32-bit STAT_* registers, in the order of vnic_stat_regs[] */
+enum vnic_stat {
+	VNIC_STAT_TXPKTS,
+	VNIC_STAT_TXBYTES,
+	VNIC_STAT_RXPKTS,
+	VNIC_STAT_RXBYTES,
+	VNIC_STAT_TXDROP,
+	VNIC_STAT_RXDROP,
+	VNIC_NSTATS,
+};
+
+/**
+ * struct vnic_stats - device counters accumulated into 64-bit totals
+ * @lock: serialises vnic_stats_update() between its callers
+ * @total: running totals since the netdev was registered
+ * @last: register values at the previous read, for the u32 delta
+ * @work: periodic read, so a 32-bit register can't wrap twice unseen
+ */
+struct vnic_stats {
+	spinlock_t lock;
+	u64 total[VNIC_NSTATS];
+	u32 last[VNIC_NSTATS];
+	struct delayed_work work;
+};
+
 /**
  * struct vnic_priv - per-netdev private state (netdev_priv area)
  * @hal: backend handle; the only way the core reaches "the device"
@@ -65,6 +91,7 @@ struct vnic_ring {
  * @dev: back-pointer to the owning net_device
  * @napi: NAPI context for the poll loop
  * @rx_buf_size: RX skb size, tracks the MTU
+ * @stats: device counters, kept across down/up and device resets
  */
 struct vnic_priv {
 	struct vnic_hal *hal;
@@ -73,6 +100,7 @@ struct vnic_priv {
 	struct net_device *dev;
 	struct napi_struct napi;
 	u32 rx_buf_size;
+	struct vnic_stats stats;
 };
 
 /* implemented in vnic-core.c, used by the entry code in vnic-engine.c / vnic-pci.c */
