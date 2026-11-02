@@ -10,6 +10,7 @@
 #   ./run.sh -device vnic
 #   TEST=1 ./run.sh -device vnic         # non-interactive: insmod + dmesg + poweroff
 #   TEST=tap ...                         # guest half of test-tap.sh (run that instead)
+#   APPEND="vn1000.mtu=9000" ...         # extra kernel cmdline, read by /init's test branches
 #   KVM=1  ./run.sh -device vnic         # needs: sudo usermod -aG kvm $USER
 #   QEMU_BIN=/path/to/qemu-system-x86_64 ./run.sh -device vnic
 #
@@ -32,6 +33,7 @@ ACCEL=(-accel tcg)
 
 CMDLINE="console=ttyS0 panic=-1 rdinit=/init"
 [ -n "${TEST:-}" ] && CMDLINE="$CMDLINE vn1000.test=$TEST"   # picks a test branch in /init
+[ -n "${APPEND:-}" ] && CMDLINE="$CMDLINE $APPEND"
 
 exec "$QEMU" \
 	-M q35 "${ACCEL[@]}" -m 512 -smp 2 \

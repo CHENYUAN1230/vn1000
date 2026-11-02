@@ -235,7 +235,7 @@ static void vnic_run(VNICState *s)
 
     hwaddr tx_base, tx_desc_addr;
     uint32_t th, tt;
-    uint32_t txp, txb, rxdrop;
+    uint32_t txp, txb, txdrop;
     uint32_t th_start, rh_start;
     uint32_t tx_count;
     struct vn_desc txd;
@@ -249,7 +249,7 @@ static void vnic_run(VNICState *s)
     tt = s->regs[VN_REG_TDT / 4];
     txp = s->regs[VN_REG_STAT_TXPKTS / 4];
     txb = s->regs[VN_REG_STAT_TXBYTES / 4];
-    rxdrop = s->regs[VN_REG_STAT_RXDROP / 4];
+    txdrop = s->regs[VN_REG_STAT_TXDROP / 4];
 
     th_start = th;
     rh_start = s->regs[VN_REG_RDH / 4];
@@ -274,9 +274,10 @@ static void vnic_run(VNICState *s)
          * exceed either bound: the fixed host buffer capacity (sizeof(buf),
          * never guest-controlled) or the currently configured MAXFRM (which
          * the guest CAN write via MMIO, so it cannot be trusted alone).
+         * The frame is bad before either mode sees it: a TX drop in both.
          */
         if (txd.len < sizeof(struct eth_header) || txd.len > sizeof(buf) || txd.len > s->regs[VN_REG_MAXFRM / 4]) {
-            rxdrop++;
+            txdrop++;
         } else {
             if (pci_dma_read(&s->pdev, txd.addr, buf, txd.len) != MEMTX_OK) {
                 qemu_log_mask(LOG_GUEST_ERROR, "vnic: TX packet read failed at th=%u\n", th);
@@ -291,6 +292,8 @@ static void vnic_run(VNICState *s)
                 /* the net layer copies or delivers it; no peer means drop */
                 qemu_send_packet(qemu_get_queue(s->nic), buf, txd.len);
             }
+            txp++;           /* good frames only: a dropped one is in txdrop */
+            txb += txd.len;
         }
 
         /* TX always completes here, whether or not the frame was delivered */
@@ -299,15 +302,13 @@ static void vnic_run(VNICState *s)
             qemu_log_mask(LOG_GUEST_ERROR, "vnic: TX desc write failed at th=%u\n", th);
             break;
         }
-        txp++;
-        txb += txd.len;
         th = (th + 1) % tx_count;
     }
 
     s->regs[VN_REG_TDH / 4] = th;
     s->regs[VN_REG_STAT_TXPKTS / 4] = txp;
     s->regs[VN_REG_STAT_TXBYTES / 4] = txb;
-    s->regs[VN_REG_STAT_RXDROP / 4] = rxdrop;
+    s->regs[VN_REG_STAT_TXDROP / 4] = txdrop;
 
     if (th != th_start)
         cause |= VN_INT_TXDONE;

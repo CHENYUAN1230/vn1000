@@ -37,8 +37,9 @@
  * @engine: the kthread that plays "the device"
  * @run_lock: serialises one engine run against vnic_hal_quiesce()
  * @doorbell: set when TDT / RDT is written
- * @intr_tasklet: the fake ISR bottom half; engine_run() schedules it, it
- *                schedules NAPI. The PCI backend has a real hardirq ISR instead.
+ * @intr_tasklet: the fake interrupt; engine_irq_update() schedules it when an
+ *                unmasked cause is set, and its handler plays the ISR. The PCI
+ *                backend has a real MSI and hardirq ISR instead.
  *
  * Opaque to vnic-core.c: it only ever holds a struct vnic_hal *, so every field
  * that is really "the hardware" lives here rather than in struct vnic_priv.
@@ -55,6 +56,7 @@ struct vnic_hal {
 };
 
 /* internal: kthread body, tasklet, loopback rewrite, lifecycle helpers */
+static void engine_irq_update(struct vnic_hal *hal);
 static void engine_run(struct vnic_hal *hal);
 static int  engine_thread(void *data);
 static void engine_intr_tasklet(struct tasklet_struct *t);
@@ -117,8 +119,10 @@ static void engine_reset_regs(struct vnic_hal *hal)
  *
  * The core's only path to a register write, emulating what real hardware does
  * on the bus write: ICS ORs into ICR; IMS / IMC set / clear the interrupt
- * mask; CTRL.RST resets the register file (engine_reset_regs()); TDT / RDT
- * ring the doorbell and wake the engine; anything else is a plain store.
+ * mask, and an ICS or IMS write raises the interrupt if an unmasked cause is
+ * now set (engine_irq_update()); CTRL.RST resets the register file
+ * (engine_reset_regs()); TDT / RDT ring the doorbell and wake the engine;
+ * anything else is a plain store.
  */
 void vnic_hal_wr32(struct vnic_hal *hal, u32 off, u32 val)
 {
@@ -128,10 +132,12 @@ void vnic_hal_wr32(struct vnic_hal *hal, u32 off, u32 val)
 		spin_lock_irqsave(&hal->reg_lock, flags);
 		hal->regs[VN_REG_ICR / 4] |= val;
 		spin_unlock_irqrestore(&hal->reg_lock, flags);
+		engine_irq_update(hal);
 	} else if (off == VN_REG_IMS) {
 		spin_lock_irqsave(&hal->reg_lock, flags);
 		hal->regs[VN_REG_IMS / 4] |= val;
 		spin_unlock_irqrestore(&hal->reg_lock, flags);
+		engine_irq_update(hal);    /* unmask: a pending cause fires now */
 	} else if (off == VN_REG_IMC) {
 		spin_lock_irqsave(&hal->reg_lock, flags);
 		hal->regs[VN_REG_IMS / 4] &= ~val;
@@ -283,8 +289,8 @@ void vnic_hal_quiesce(struct vnic_hal *hal)
  * vnic_hal_irq_request() - arm the completion interrupt (ndo_open)
  * @hal: backend handle
  *
- * Sets up the tasklet that engine_run() schedules as the fake ISR bottom half.
- * The PCI backend does request_irq() here instead.
+ * Sets up the tasklet that engine_irq_update() schedules as the fake
+ * interrupt. The PCI backend does request_irq() here instead.
  *
  * Return: 0 (this backend cannot fail).
  */
@@ -299,7 +305,8 @@ int vnic_hal_irq_request(struct vnic_hal *hal)
  * @hal: backend handle
  *
  * tasklet_kill() flushes a bottom half already scheduled. Called after
- * vnic_hal_quiesce() so engine_run() will not reschedule it.
+ * vnic_hal_quiesce() and the reset, which cleared IMS, so nothing will
+ * reschedule it.
  */
 void vnic_hal_irq_free(struct vnic_hal *hal)
 {
@@ -309,9 +316,9 @@ void vnic_hal_irq_free(struct vnic_hal *hal)
 /* engine_create - allocate the backend, seed the RO registers, allocate the
  * rings, start the kthread
  *
- * Called from this file's module_init, once netdev/priv already exist. Fills
- * ID/VERSION/CAP + the initial IMS mask, allocates the TX/RX rings, then
- * starts the engine kthread last: it parks on the doorbell wq until the first
+ * Called from this file's module_init, once netdev/priv already exist. Seeds
+ * the power-on registers (all causes masked, as on the QEMU device; vnic_open()
+ * unmasks them), allocates the TX/RX rings, then starts the engine kthread last: it parks on the doorbell wq until the first
  * TDT / RDT write, so nothing above it can race it, and if kthread_run()
  * fails there is nothing left running that needs to be torn back down.
  *
@@ -331,10 +338,7 @@ static struct vnic_hal *engine_create(struct vnic_priv *priv)
 	mutex_init(&hal->run_lock);
 	init_waitqueue_head(&hal->wq);
 
-	/* power-on registers + initial interrupt mask, before the engine ever runs */
-	engine_reset_regs(hal);
-	vnic_hal_wr32(hal, VN_REG_IMS,
-		      VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY | VN_INT_ERR);
+	engine_reset_regs(hal);    /* power-on registers, before the engine ever runs */
 
 	ret = vnic_hal_ring_alloc(hal, &priv->tx_ring, VNIC_TX_RING_SIZE);
 	if (ret)
@@ -387,32 +391,49 @@ static void engine_destroy(struct vnic_hal *hal)
 /* internal: the fake device */
 
 /**
- * engine_intr_tasklet() - the fake ISR bottom half
+ * engine_irq_update() - raise the fake interrupt if an unmasked cause is set
+ * @hal: backend handle
+ *
+ * The engine's counterpart of the QEMU device's vnic_irq_update(): the
+ * interrupt (the tasklet) fires only when (ICR & IMS) != 0. Called where that
+ * can newly become true: an ICS write (a cause was raised) or an IMS write (a
+ * pending cause was unmasked).
+ */
+static void engine_irq_update(struct vnic_hal *hal)
+{
+	unsigned long flags;
+	bool active;
+
+	spin_lock_irqsave(&hal->reg_lock, flags);
+	active = hal->regs[VN_REG_ICR / 4] & hal->regs[VN_REG_IMS / 4];
+	spin_unlock_irqrestore(&hal->reg_lock, flags);
+	if (active)
+		tasklet_schedule(&hal->intr_tasklet);
+}
+
+/**
+ * engine_intr_tasklet() - the fake ISR
  * @t: the tasklet embedded in struct vnic_hal as @intr_tasklet;
  *     from_tasklet() recovers the containing struct vnic_hal *
  *
- * engine_run() schedules this after a pass. It reads the interrupt cause,
- * checks it against the mask, and (if a TX/RX-relevant cause is set and
- * unmasked) closes those mask bits and schedules NAPI. ERR alone does not wake
- * NAPI: an OOM is not something a poll can fix.
+ * Runs once engine_irq_update() has fired it, so the mask is already applied;
+ * like vnic_pci_isr() it reads (and clears) ICR, masks the datapath causes and
+ * schedules NAPI. ERR alone does not wake NAPI: an OOM is not something a poll
+ * can fix.
  */
 static void engine_intr_tasklet(struct tasklet_struct *t)
 {
 	struct vnic_hal *hal = from_tasklet(hal, t, intr_tasklet);
 	struct vnic_priv *priv = hal->priv;
 	u32 cause = vnic_hal_rd32(hal, VN_REG_ICR);
-	u32 mask = vnic_hal_rd32(hal, VN_REG_IMS);
 
-	if (cause & mask & ~VN_INT_ERR) {
-		if (napi_schedule_prep(&priv->napi)) {
-			vnic_hal_wr32(hal, VN_REG_IMC,
-				      VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY);
-			PDEBUG("engine_intr_tasklet: masked TX/RX/RXEMPTY, mask now=0x%x\n",
-			       vnic_hal_rd32(hal, VN_REG_IMS));
-			__napi_schedule(&priv->napi);
-		}
-		PDEBUG("engine_intr_tasklet: cause=0x%x, mask=0x%x\n", cause, mask);
+	if (!(cause & ~VN_INT_ERR))
+		return;
+	if (napi_schedule_prep(&priv->napi)) {
+		vnic_hal_wr32(hal, VN_REG_IMC, VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY);
+		__napi_schedule(&priv->napi);
 	}
+	PDEBUG("engine_intr_tasklet: cause=0x%x\n", cause);
 }
 
 /* engine_run - loop [TDH, TDT) TX frames back into the RX ring
@@ -433,7 +454,7 @@ static void engine_run(struct vnic_hal *hal)
 	struct vnic_ring *rx_ring;
 	u32 th, tt, txp, txb;
 	u32 rh, rt, rxp, rxb;
-	u32 rxdrop;
+	u32 txdrop;
 	u32 th_start, rh_start;
 
 	priv = hal->priv;
@@ -447,7 +468,7 @@ static void engine_run(struct vnic_hal *hal)
 	rx_ring = &priv->rx_ring;
 	rxp = vnic_hal_rd32(hal, VN_REG_STAT_RXPKTS);
 	rxb = vnic_hal_rd32(hal, VN_REG_STAT_RXBYTES);
-	rxdrop = vnic_hal_rd32(hal, VN_REG_STAT_RXDROP);
+	txdrop = vnic_hal_rd32(hal, VN_REG_STAT_TXDROP);
 	th_start = th;
 
 	/* No tx_ring->lock here: that lock only serialises vnic_tx() against
@@ -474,7 +495,7 @@ static void engine_run(struct vnic_hal *hal)
 		 */
 		if (tx_ring->bufs[th]->len < sizeof(struct ethhdr)) {
 			PDEBUG("engine_run: loopback dropped frame at th=%u (len=%u too short)\n", th, tx_ring->bufs[th]->len);
-			rxdrop++;
+			txdrop++;
 		} else {
 			/* real hardware DMAs from desc->addr; the PCI backend replaces this memcpy */
 			memcpy(rx_ring->bufs[rh]->data, tx_ring->bufs[th]->data, tx_ring->bufs[th]->len);
@@ -485,23 +506,23 @@ static void engine_run(struct vnic_hal *hal)
 			dma_wmb(); /* data + len visible before DD says "ready" */
 			WRITE_ONCE(rx_ring->desc[rh].status, rx_ring->desc[rh].status | VN_DESC_DD);
 			rh = (rh + 1) % rx_ring->count;
+			txp++; /* good frames only: a dropped one is in txdrop */
+			txb += tx_ring->desc[th].len;
 		}
 
 		dma_wmb(); /* pairs with rmb() in vnic_tx_poll() */
 		WRITE_ONCE(tx_ring->desc[th].status, tx_ring->desc[th].status | VN_DESC_DD);
-		txp++;
-		txb += tx_ring->desc[th].len;
 		th = (th + 1) % tx_ring->count;
 	}
 
 	vnic_hal_wr32(hal, VN_REG_RDH, rh);
 	vnic_hal_wr32(hal, VN_REG_STAT_RXPKTS, rxp);
 	vnic_hal_wr32(hal, VN_REG_STAT_RXBYTES, rxb);
-	vnic_hal_wr32(hal, VN_REG_STAT_RXDROP, rxdrop);
+	vnic_hal_wr32(hal, VN_REG_STAT_TXDROP, txdrop);
 	spin_unlock_bh(&rx_ring->lock);
 
 	if (th != th_start) {
-		PDEBUG("engine_run: processed th %u->%u, txp=%u rxp=%u rxdrop=%u\n", th_start, th, txp, rxp, rxdrop);
+		PDEBUG("engine_run: processed th %u->%u, txp=%u rxp=%u txdrop=%u\n", th_start, th, txp, rxp, txdrop);
 		vnic_hal_wr32(hal, VN_REG_ICS, VN_INT_TXDONE);
 	}
 	if (rh != rh_start)
@@ -511,7 +532,6 @@ static void engine_run(struct vnic_hal *hal)
 	vnic_hal_wr32(hal, VN_REG_TDH, th);
 	vnic_hal_wr32(hal, VN_REG_STAT_TXPKTS, txp);
 	vnic_hal_wr32(hal, VN_REG_STAT_TXBYTES, txb);
-	tasklet_schedule(&hal->intr_tasklet);
 }
 
 /* engine_thread - kthread main loop: wait for the doorbell, run one pass,

@@ -6,76 +6,27 @@
 # and this host (10.1.0.2). The guest half is the vn1000.test=tap branch of
 # /init (build-initramfs.sh); the two halves sync on "=== VNIC ..." lines on
 # the serial console, and the host signals the guest over TCP port 9000.
+# Checks the environment first and repacks the initramfs (common.sh).
 #
-#   ./test-tap.sh                       # needs a PCI build: make VNIC_BACKEND=pci,
-#                                       # then ./build-initramfs.sh
+#   ./test-tap.sh                       # needs a PCI build: make VNIC_BACKEND=pci && make raw_flood
+#   KVM=1 ./test-tap.sh                 # same, under KVM
 #   MAC=52:54:00:aa:bb:cc ./test-tap.sh # expect (and set) a different MAC
 #   TIMEOUT=120 ./test-tap.sh           # seconds to wait for each guest step
 #
 # Needs sudo (setup-tap.sh, ping -f). Exit status 0 only if every check passes.
 set -uo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$(dirname "$0")/common.sh"
 MAC="${MAC:-52:54:00:12:34:56}"
-TIMEOUT="${TIMEOUT:-60}"
-WORK="$(mktemp -d)"
-LOG="$WORK/serial.log"
-MON="$WORK/monitor.sock"
-PASS=0
-FAIL=0
 
-for f in "$HERE/vmlinuz" "$HERE/initramfs.cpio.gz"; do
-	[ -f "$f" ] || { echo "missing $f: see the header comments of run.sh / build-initramfs.sh" >&2; exit 2; }
-done
-
-result() {	# result <ok|fail> <name> <detail>
-	if [ "$1" = ok ]; then
-		PASS=$((PASS + 1)); printf '[PASS] %-7s %s\n' "$2" "$3"
-	else
-		FAIL=$((FAIL + 1)); printf '[FAIL] %-7s %s\n' "$2" "$3"
-	fi
-}
-
-# wait_for <marker>: wait until the guest prints "=== VNIC <marker>"
-wait_for() {
-	local i
-	for ((i = 0; i < TIMEOUT * 2; i++)); do
-		grep -aq "^=== VNIC $1" "$LOG" && return 0
-		sleep 0.5
-	done
-	return 1
-}
-
-# field <marker>: the text after "=== VNIC <marker> "
-field() {
-	grep -a "^=== VNIC $1" "$LOG" | head -1 | tr -d '\r' | cut -d' ' -f4-
-}
-
-finish() {
-	python3 - "$MON" <<'EOF' 2>/dev/null
-import socket, sys
-s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"quit\n")
-EOF
-	wait "$QEMU_PID" 2>/dev/null
-	echo "$PASS/$((PASS + FAIL)) passed. Full log: $LOG"
-	[ "$FAIL" -eq 0 ]
-	exit
-}
-
-abort() {	# abort <name> <what>: a guest step never showed up
-	result fail "$1" "timed out waiting for the guest ($2)"
-	finish
-}
-
-"$HERE/setup-tap.sh" >/dev/null || exit 2
+preflight tap
+is_pci || die "driver/vnic.ko is not a PCI build: make -C driver VNIC_BACKEND=pci"
+pack
 sudo ip neigh flush dev tap0
 
-TEST=tap "$HERE/run.sh" \
+boot tap \
 	-netdev tap,id=n0,ifname=tap0,script=no,downscript=no \
-	-device vnic,loopback=off,netdev=n0,mac="$MAC" \
-	-monitor unix:"$MON",server,nowait \
-	</dev/null >"$LOG" 2>&1 &
-QEMU_PID=$!
+	-device vnic,loopback=off,netdev=n0,mac="$MAC"
 
 # guest: MAC, then A (L2 -> L1 ping) and B (same after a down/up)
 wait_for MAC || abort MAC "boot / insmod"
@@ -113,6 +64,10 @@ delta=$((rx1 - rx0))
 [ "$delta" -ge "${sent:-0}" ] && [ "$drop" -eq 0 ] \
 	&& result ok F "backlog of $sent frames across down/up: $delta received, rx_dropped $drop" \
 	|| result fail F "backlog of $sent frames: $delta received, rx_dropped $drop"
+
+# TXDROP: rejected TX frames count as TX drops only (see check_txdrop)
+wait_for TXDROP || abort TXDROP "TXDROP"
+check_txdrop
 
 wait_for DONE || abort DONE "DONE"
 finish

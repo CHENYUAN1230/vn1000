@@ -5,8 +5,7 @@
  * handshakes. Reaches "the device" only through vnic-hal.h. No module entry
  * point here; that lives in the build-specific half (vnic-engine.c / vnic-pci.c).
  *
- * TODO: batch refill - accumulate N completions before refilling the rx ring;
- * ring the TX doorbell only every N packets.
+ * TODO: batch refill - accumulate N completions before refilling the rx ring.
  */
 
 #include <linux/kernel.h>	/* printk() */
@@ -76,10 +75,12 @@ static void vnic_hw_config(struct vnic_priv *priv)
  * vnic_open() - ndo_open: bring the interface up
  * @dev: the network device
  *
- * Programs the device (vnic_hw_config()), opens the TX/RX gate, posts the RX
- * ring with fresh skbs, arms the completion interrupt, enables NAPI, and
- * unmasks the causes vnic_release() masked off. netif_start_queue() is last:
- * nothing above this point can race a vnic_tx() that hasn't started yet.
+ * Programs the device (vnic_hw_config()), installs the interrupt handler,
+ * opens the TX/RX gate, posts the RX ring with fresh skbs, enables NAPI, and
+ * unmasks the causes vnic_release() masked off. The handler goes in before
+ * the gate opens, so it exists before the device can do anything that raises
+ * an interrupt. netif_start_queue() is last: nothing above this point can
+ * race a vnic_tx() that hasn't started yet.
  *
  * Return: 0 on success, negative errno on failure.
  */
@@ -91,13 +92,14 @@ static int vnic_open(struct net_device *dev)
 	priv->rx_buf_size = dev->mtu + VN_FRAME_OVERHEAD; /* mtu might change */
 
 	vnic_hw_config(priv);
+
+	ret = vnic_hal_irq_request(priv->hal); /* engine: tasklet_setup   pci: request_irq */
+	if (ret)
+		return ret;
+
 	vnic_hal_wr32(priv->hal, VN_REG_CTRL, VN_CTRL_TXEN | VN_CTRL_RXEN); /* open TX/RX gate */
 
 	ret = vnic_rx_post(priv);
-	if (ret)
-		goto err_drain_rx;
-
-	ret = vnic_hal_irq_request(priv->hal); /* engine: tasklet_setup   pci: request_irq */
 	if (ret)
 		goto err_drain_rx;
 
@@ -110,6 +112,9 @@ static int vnic_open(struct net_device *dev)
 	return 0;
 
 err_drain_rx:
+	vnic_hal_wr32(priv->hal, VN_REG_CTRL, 0); /* close the gate again; IMS is still masked */
+	vnic_hal_quiesce(priv->hal);
+	vnic_hal_irq_free(priv->hal);
 	vnic_rx_drain(priv);
 	return ret;
 }
@@ -162,6 +167,7 @@ static void vnic_tx_poll(struct vnic_priv *priv, int budget)
 {
 	struct vnic_ring *tx_ring = &priv->tx_ring;
 	struct sk_buff *skb;
+	unsigned int pkts = 0, bytes = 0;
 
 	spin_lock(&tx_ring->lock); /* NAPI runs in softirq context; no _bh against vnic_tx()'s spin_lock_bh() */
 	while (tx_ring->next_to_clean != tx_ring->next_to_use) {
@@ -170,12 +176,15 @@ static void vnic_tx_poll(struct vnic_priv *priv, int budget)
 		dma_rmb(); /* pairs with wmb() in engine_run() before it sets DD */
 		skb = tx_ring->bufs[tx_ring->next_to_clean];
 		vnic_hal_unmap(priv->hal, tx_ring->desc[tx_ring->next_to_clean].addr, skb->len, DMA_TO_DEVICE);
+		pkts++;
+		bytes += skb->len; /* same skb->len vnic_tx() reported to BQL */
 		napi_consume_skb(skb, budget); /* normal completion, not an error drop */
 		tx_ring->bufs[tx_ring->next_to_clean] = NULL;
 		dma_wmb(); /* bufs=NULL must be visible before the slot is freed */
 		WRITE_ONCE(tx_ring->desc[tx_ring->next_to_clean].status, 0);
 		tx_ring->next_to_clean = (tx_ring->next_to_clean + 1) % tx_ring->count;
 	}
+	netdev_completed_queue(priv->dev, pkts, bytes); /* BQL; also wakes a BQL stop */
 	if (netif_queue_stopped(priv->dev) &&
 	    (tx_ring->next_to_use + 1) % tx_ring->count != tx_ring->next_to_clean) {
 		PDEBUG("vnic_tx_poll: waking queue, next_to_use=%u next_to_clean=%u\n",
@@ -207,6 +216,7 @@ static int vnic_tx_drain(struct vnic_priv *priv)
 	}
 	tx_ring->next_to_use = 0;
 	tx_ring->next_to_clean = 0;
+	netdev_reset_queue(priv->dev); /* BQL: the swept skbs will never complete */
 	vnic_hal_wr32(priv->hal, VN_REG_TDT, 0); /* TDH already reset by CTRL_RST in vnic_release() */
 	spin_unlock_bh(&tx_ring->lock);
 	PDEBUG("vnic_tx_drain: freed %u tx buffers\n", drained);
@@ -377,7 +387,9 @@ int vnic_poll(struct napi_struct *napi, int budget)
  * @skb: packet to send; this function takes ownership of it
  * @dev: the network device
  *
- * Maps the payload, queues the descriptor, and rings the TX doorbell.
+ * Maps the payload and queues the descriptor. The TX doorbell is deferred
+ * while the stack has more packets coming (xmit_more, which BQL enables), so
+ * a burst costs one TDT write. Stops the queue as soon as the ring fills.
  *
  * Return: NETDEV_TX_OK (skb consumed, sent or dropped) or NETDEV_TX_BUSY
  * (ring full; @skb is untouched, the stack will retry it).
@@ -389,15 +401,16 @@ static int vnic_tx(struct sk_buff *skb, struct net_device *dev)
 	struct vnic_ring *tx_ring = &priv->tx_ring;
 	struct vn_desc *des = tx_ring->desc;
 	struct sk_buff **buf = tx_ring->bufs;
+	struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
 	dma_addr_t dma;
 
 	spin_lock_bh(&tx_ring->lock); /* guards against vnic_tx_poll() running in softirq context */
 	if ((tx_ring->next_to_use + 1) % tx_ring->count == tx_ring->next_to_clean) { /* one slot reserved for full vs. empty */
 		PDEBUG("vnic_tx: ring full, next_to_use=%u next_to_clean=%u, stopping queue\n",
 		       tx_ring->next_to_use, tx_ring->next_to_clean);
-		netif_stop_queue(dev);
+		netif_stop_queue(dev); /* not expected: the queue is stopped when the ring fills */
 		ret = NETDEV_TX_BUSY;
-		goto out;
+		goto flush;
 	}
 
 	/* check whether the skb is fragmented */
@@ -405,7 +418,7 @@ static int vnic_tx(struct sk_buff *skb, struct net_device *dev)
 		dev->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);   /* once we own this skb we must dispose of it, even on failure */
 		ret = NETDEV_TX_OK;       /* the skb has already been consumed (dropped) */
-		goto out;
+		goto flush;
 	}
 
 	dma = vnic_hal_map(priv->hal, skb->data, skb->len, DMA_TO_DEVICE);
@@ -413,7 +426,7 @@ static int vnic_tx(struct sk_buff *skb, struct net_device *dev)
 		dev->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);   /* same reasoning as the skb_linearize() failure above */
 		ret = NETDEV_TX_OK;
-		goto out;
+		goto flush;
 	}
 
 	des[tx_ring->next_to_use].addr = dma;
@@ -424,8 +437,18 @@ static int vnic_tx(struct sk_buff *skb, struct net_device *dev)
 
 	PDEBUG("vnic_tx: queued idx=%u len=%u\n", tx_ring->next_to_use, skb->len);
 	tx_ring->next_to_use = (tx_ring->next_to_use + 1) % tx_ring->count;
-	vnic_hal_wr32(priv->hal, VN_REG_TDT, tx_ring->next_to_use); /* [TDH, next_to_use) is a half-open range */
+	if ((tx_ring->next_to_use + 1) % tx_ring->count == tx_ring->next_to_clean)
+		netif_stop_queue(dev); /* before the BQL call, so it sees the stop and rings now */
 
+	/* [TDH, next_to_use) is a half-open range */
+	if (__netdev_tx_sent_queue(txq, skb->len, netdev_xmit_more()))
+		vnic_hal_wr32(priv->hal, VN_REG_TDT, tx_ring->next_to_use);
+	goto out;
+
+flush:
+	/* this skb was not queued, but an earlier one may have left the doorbell to it */
+	if (!netdev_xmit_more() || netif_xmit_stopped(txq))
+		vnic_hal_wr32(priv->hal, VN_REG_TDT, tx_ring->next_to_use);
 out:
 	spin_unlock_bh(&tx_ring->lock);
 	return ret;

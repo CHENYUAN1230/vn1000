@@ -4,7 +4,7 @@ A virtual 1GbE NIC built from scratch: a QEMU PCI device model and its Linux
 driver, developed against each other so both sides of the MMIO / DMA boundary
 agree by construction.
 
-The Linux driver is `vnic` — the VN1000's driver, the way `igb` is the I210's.
+The Linux driver is `vnic`, the VN1000's driver, the way `igb` is the I210's.
 `include/vnic_regs.h` is the hardware spec, shared verbatim by the driver and
 the QEMU device.
 
@@ -49,7 +49,7 @@ kthread, then against QEMU, with `vnic-core.c` unchanged.
 | 3 | DMA datapath: `dma_alloc_coherent` rings, `dma_map_single` buffers, real MSI ISR → `napi_schedule`, `register_netdev`; QEMU device does IP-swap loopback internally so the full test methodology re-runs over real DMA/MMIO/MSI | **Done**, see [`test-logs/Phase3_test.md`](test-logs/Phase3_test.md) |
 | 4 | Real `tap` backend: device TX `qemu_send_packet`, RX `can_receive`/`receive`; ping guest ↔ host, `tcpdump` on the tap | **Done**, see [`test-logs/Phase4_test.md`](test-logs/Phase4_test.md) |
 | 5 | Finalize the netdev: full device reset (`CTRL.RST` and QEMU system reset return the device to power-on state, the driver reprograms it on every open); a stable MAC loaded from the device (`MAC_LO`/`MAC_HI`); 64-bit software-accumulated stats; a repeatable tap-mode test script | **Done**, see [`test-logs/Phase5_test.md`](test-logs/Phase5_test.md) |
-| 6 | Polish: TX doorbell moderation, device-side ITR, MTU sweep, KASAN/lockdep/kmemleak gate on the DMA paths, docs/diagrams, demo | Not started |
+| 6 | Performance and test tooling: `perf kvm stat` exit profiling; TX doorbell batched with BQL + `xmit_more`; the ISR masks interrupts before scheduling NAPI; rejected TX frames counted as TX drops only; scripted loopback tests and throughput benchmark; engine backend reload crash fixed with the QEMU device's interrupt model | **Done**, see [`test-logs/Phase6_test.md`](test-logs/Phase6_test.md) |
 
 ## Building and loading
 
@@ -90,7 +90,7 @@ make VNIC_BACKEND=pci && make raw_flood
 
 cd ../nested-vm
 cp /boot/vmlinuz-$(uname -r) vmlinuz   # once: your own kernel image, not tracked in git
-./build-initramfs.sh                   # packs busybox + ../driver/vnic.ko + raw_flood
+./build-initramfs.sh                   # packs busybox + ../driver/vnic.ko + raw_flood (+ iperf3 if installed)
 ./run.sh -device vnic                  # interactive shell inside the VM
 ```
 
@@ -156,6 +156,39 @@ from the host, the host's neighbor entry for the guest's MAC, and a backlog
 of frames queued while the guest is down. See
 [`test-logs/Phase5_test.md`](test-logs/Phase5_test.md).
 
+The loopback suite (ping sizes, fragmented ping, MTU range, down/up, raw
+flood, BQL accounting, TX drop counting, `rmmod` while up, reloads, clean
+`dmesg`) runs the same way, on whichever backend `driver/vnic.ko` was built
+for:
+
+```bash
+cd nested-vm
+KVM=1 ./test-loopback.sh
+```
+
+Both test scripts first check the environment (VM kernel image, QEMU in sync
+with `qemu-device/vnic.c`, tap0) and repack the initramfs around the current
+`driver/vnic.ko`.
+
+### Measuring throughput
+
+`bench-tap.sh` boots the VM on tap0, runs iperf3 between the host and the
+guest (TCP both ways, 64 byte UDP with 1 and 4 streams, UDP at fixed rates),
+and prints every run and the median, with interrupt rates and drop counts.
+`build-initramfs.sh` packs the host's `iperf3` into the image for it.
+
+```bash
+cd nested-vm
+KVM=1 ./bench-tap.sh                   # the working tree's driver (PCI build)
+KVM=1 REV=07ab85f ./bench-tap.sh       # the driver at another commit
+KVM=1 MTU=9000 TESTS="tcp-tx tcp-rx" ./bench-tap.sh
+```
+
+Use `KVM=1`; under TCG the CPU emulation dominates. Absolute numbers depend
+on the host, so compare versions back to back in one session. Results, and
+the `perf kvm stat` breakdown that guided the Phase 6 changes, are in
+[`test-logs/Phase6_test.md`](test-logs/Phase6_test.md).
+
 ## Layout
 
 ```
@@ -171,6 +204,9 @@ driver/raw_flood.c        raw-socket flood helper for past-ring-capacity stress
 nested-vm/                scripts that boot a throwaway VM to test the PCI backend
 nested-vm/setup-tap.sh    creates the host's tap0 for tap mode
 nested-vm/test-tap.sh     automated tap-mode test (host and guest halves)
+nested-vm/test-loopback.sh automated loopback-mode test, either backend
+nested-vm/bench-tap.sh    throughput benchmark over tap0 (iperf3)
+nested-vm/common.sh       shared by the scripts above: environment checks, VM boot
 test-logs/                per-phase test logs
 ```
 

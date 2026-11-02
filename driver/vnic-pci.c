@@ -237,6 +237,10 @@ void vnic_hal_irq_free(struct vnic_hal *hal)
  * indirection is gone. request_irq() only ever happens from ndo_open (after
  * register_netdev()), so hal->priv is always valid by the time this can fire.
  *
+ * Masks the datapath causes before scheduling NAPI, as engine_intr_tasklet()
+ * does: no MSI while a poll is pending or running. vnic_poll() unmasks them
+ * when it completes; causes raised meanwhile stay latched in ICR and fire then.
+ *
  * Return: IRQ_HANDLED if this was our interrupt, IRQ_NONE otherwise.
  */
 static irqreturn_t vnic_pci_isr(int irq, void *data)
@@ -247,7 +251,10 @@ static irqreturn_t vnic_pci_isr(int irq, void *data)
 	if (!icr)
 		return IRQ_NONE;                    /* not ours - shared-irq etiquette */
 
-	napi_schedule(&hal->priv->napi);
+	if (napi_schedule_prep(&hal->priv->napi)) {
+		vnic_hal_wr32(hal, VN_REG_IMC, VN_INT_TXDONE | VN_INT_RXAVAIL | VN_INT_RXEMPTY);
+		__napi_schedule(&hal->priv->napi);
+	}
 	return IRQ_HANDLED;
 }
 
